@@ -1,0 +1,10 @@
+model:
+  name: matrix_factorization
+  num_users: 100000
+  num_items: 50000
+  embedding_dim: 64
+
+training:
+  batch_size: 1024
+  learning_rate: 0.001
+  epochs: 10
