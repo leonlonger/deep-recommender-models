@@ -1,0 +1,7 @@
+tensorflow
+google-cloud-bigquery[pandas]
+google-cloud-bigquery-storage
+pandas
+pyarrow
+db-dtypes
+PyYAML

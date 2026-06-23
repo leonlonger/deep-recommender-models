@@ -1,10 +1,101 @@
+data:
+  source: bigquery
+  project_id: phia-prod-416420
+  table_id: phia-prod-416420.ml.recommendation_metadata_training_examples
+  row_limit: 100000
+  inspect_row_limit: 1000
+  where:
+  selected_columns:
+    - dt
+    - impression_id
+    - phia_id
+    - event_time
+    - product_url
+    - cleaned_product_url
+    - domain
+    - reg_domain
+    - platform
+    - page_type
+    - module
+    - position
+    - rank
+    - request_id
+    - action_id
+    - surface
+    - clicked
+    - scraped_brand
+    - scraped_name
+    - scraped_price
+    - scraped_image_url
+    - category_level_1
+    - category_level_2
+    - category_level_3
+    - category_level_4
+    - category_confidence
+    - user_is_registered
+    - user_is_active
+    - user_type
+    - user_country
+    - user_region
+    - user_city
+    - acquisition_channel
+    - acquisition_source
+    - preferred_brand_count
+    - preferred_brand_names
+    - pref_is_free_shipping
+    - pref_is_returnable
+    - pref_is_vintage
+    - pref_size_values
+    - user_30d_impressions
+    - user_30d_clicks
+    - user_30d_favorites
+    - product_30d_impressions
+    - product_30d_clicks
+    - product_30d_favorites
+    - domain_30d_impressions
+    - domain_30d_clicks
+    - domain_30d_favorites
+    - app_7d_product_impress
+    - app_7d_product_click
+    - trending_score_7d
+    - trending_rank_7d
+    - seller_top50_score_7d
+    - seller_rank_7d
+    - recent_viewed_rank_1d
+
+label:
+  # If empty, main.py tries common names such as label, clicked, is_click, conversion.
+  column: clicked
+  fallback_columns: [is_click]
+  # Set this if your target is a count/rating/watch-time style column and should be binarized.
+  positive_threshold:
+
+features:
+  auto_infer: true
+  numeric_columns: []
+  categorical_columns: []
+  exclude_columns:
+    - dt
+    - event_time
+    - impression_id
+    - request_id
+    - action_id
+    - scraped_image_url
+  categorical_hash_bins: 20000
+  embedding_dim: 8
+
 model:
-  user_feature_dim: 64
-  item_feature_dim: 64
-  hidden_dims: [128, 64]
-  dropout: 0.1
+  hidden_units: [256, 128, 64]
+  activation: relu
+  dropout: 0.2
+  l2: 0.000001
 
 training:
   batch_size: 1024
   learning_rate: 0.001
   epochs: 10
+  validation_fraction: 0.2
+  seed: 42
+  early_stopping_patience: 2
+  class_weight: balanced
+  output_dir: models/homepage_dnn
