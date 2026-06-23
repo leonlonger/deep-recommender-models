@@ -1,38 +1,38 @@
-# Deep Recommender Models
+# Deep Learning Recommendation Models
 
-This repository stores deep learning recommendation model implementations.
-It is organized so multiple models can share common embedding, training, and
-evaluation utilities while keeping each model implementation isolated.
+这个仓库用于存放深度学习推荐算法模型代码。
 
-## Structure
+根目录只保留 README、依赖说明等基础文件；每个推荐场景或模型单独放在一个目录中，目录内部维护自己的 `main.py`、`model.py`、`config.yaml` 和说明文档。
+
+## 目录结构
 
 ```text
 .
-├── configs/                    # Model and experiment configs
-├── scripts/                    # Training/evaluation entry points
-├── src/deep_recommender_models/
-│   ├── models/                 # Model implementations
-│   └── typing.py               # Shared type aliases
-└── tests/                      # Unit tests
+├── README.md
+├── requirements.txt
+├── homepage_recommendation/    # 首页推荐场景
+├── deepfm/                     # DeepFM 排序模型
+├── two_tower_recall/           # 双塔召回模型
+└── din/                        # DIN 排序模型
 ```
 
-## Included Models
+## 现有目录
 
-- `MatrixFactorization`: latent factor baseline for user-item interactions.
-- `WideAndDeep`: simple wide-and-deep ranking model skeleton.
+- `homepage_recommendation`: 首页推荐模型入口，适合组合召回、排序、重排等逻辑。
+- `deepfm`: DeepFM 模型示例。
+- `two_tower_recall`: 用户塔和物品塔召回模型示例。
+- `din`: Deep Interest Network 模型示例。
 
-## Quick Start
+## 新增模型目录约定
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-pytest
+新增模型时，在根目录创建一个新的文件夹：
+
+```text
+new_model_name/
+├── README.md
+├── config.yaml
+├── main.py
+└── model.py
 ```
 
-## Adding A Model
-
-1. Create a file under `src/deep_recommender_models/models/`.
-2. Subclass `BaseRecommender`.
-3. Export the model in `src/deep_recommender_models/models/__init__.py`.
-4. Add focused tests in `tests/`.
+每个模型目录应尽量独立，方便单独运行、调试和替换实验配置。

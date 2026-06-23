@@ -1,0 +1,11 @@
+model:
+  num_fields: 16
+  vocab_size: 100000
+  embedding_dim: 16
+  mlp_dims: [128, 64]
+  dropout: 0.1
+
+training:
+  batch_size: 1024
+  learning_rate: 0.001
+  epochs: 10

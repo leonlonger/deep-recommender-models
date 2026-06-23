@@ -1,7 +1,6 @@
 model:
-  name: matrix_factorization
-  num_users: 100000
-  num_items: 50000
+  user_feature_dim: 128
+  item_feature_dim: 128
   embedding_dim: 64
 
 training:
