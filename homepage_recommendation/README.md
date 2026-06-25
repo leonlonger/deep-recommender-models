@@ -21,6 +21,12 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
+如果要使用 GPU 训练，安装额外 CUDA/cuDNN wheel：
+
+```bash
+.venv/bin/python -m pip install -r requirements-gpu.txt
+```
+
 如果本机没有 `pip`，先在项目目录外创建一个支持 TensorFlow 的 Python 环境，再安装依赖。
 
 ## GCP 认证
@@ -72,10 +78,17 @@ features:
 .venv/bin/python main.py
 ```
 
+GPU 训练使用封装脚本，它会自动把 `.venv` 中的 CUDA/cuDNN 动态库加入 `LD_LIBRARY_PATH`：
+
+```bash
+scripts/train_gpu.sh
+```
+
 小样本 smoke test 可以跳过模型导出：
 
 ```bash
 .venv/bin/python main.py --limit 5000 --epochs 1 --skip-export
+scripts/train_gpu.sh --limit 5000 --epochs 1 --skip-export
 ```
 
 训练完成后会输出：
