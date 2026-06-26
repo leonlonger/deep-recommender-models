@@ -140,6 +140,8 @@ scripts/train_gpu.sh --limit 5000 --epochs 1 --skip-export
 - `models/homepage_dnn/saved_model`
 - `models/homepage_dnn/training_metadata.json`
 
+`training_metadata.json` 的 `history` 和 `evaluation` 会保留 AUC、PCOC、accuracy、precision、recall 等指标；启用验证集时 `history` 里也会包含 `val_pcoc`。
+
 如果当前工作区磁盘空间不足，可以把模型写到 `/tmp`：
 
 ```bash

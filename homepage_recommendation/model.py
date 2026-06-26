@@ -22,6 +22,40 @@ class FeatureSpec:
         return asdict(self)
 
 
+@tf.keras.utils.register_keras_serializable(package="homepage_recommendation")
+class PCOC(tf.keras.metrics.Metric):
+    """Predicted clicks over clicked clicks."""
+
+    def __init__(self, name: str = "pcoc", **kwargs: Any) -> None:
+        super().__init__(name=name, **kwargs)
+        self.predicted_clicks = self.add_weight(name="predicted_clicks", initializer="zeros")
+        self.clicked_clicks = self.add_weight(name="clicked_clicks", initializer="zeros")
+
+    def update_state(
+        self,
+        y_true: tf.Tensor,
+        y_pred: tf.Tensor,
+        sample_weight: tf.Tensor | None = None,
+    ) -> None:
+        y_true = tf.reshape(tf.cast(y_true, self.dtype), [-1])
+        y_pred = tf.reshape(tf.cast(y_pred, self.dtype), [-1])
+
+        if sample_weight is not None:
+            sample_weight = tf.reshape(tf.cast(sample_weight, self.dtype), [-1])
+            y_true = y_true * sample_weight
+            y_pred = y_pred * sample_weight
+
+        self.predicted_clicks.assign_add(tf.reduce_sum(y_pred))
+        self.clicked_clicks.assign_add(tf.reduce_sum(y_true))
+
+    def result(self) -> tf.Tensor:
+        return tf.math.divide_no_nan(self.predicted_clicks, self.clicked_clicks)
+
+    def reset_state(self) -> None:
+        self.predicted_clicks.assign(0.0)
+        self.clicked_clicks.assign(0.0)
+
+
 def build_numeric_normalizer(
     dataframe: pd.DataFrame,
     numeric_columns: tuple[str, ...],
@@ -118,6 +152,7 @@ def build_homepage_recommendation_model(
         loss=tf.keras.losses.BinaryCrossentropy(name="binary_crossentropy"),
         metrics=[
             tf.keras.metrics.AUC(name="auc"),
+            PCOC(name="pcoc"),
             tf.keras.metrics.BinaryAccuracy(name="binary_accuracy"),
             tf.keras.metrics.Precision(name="precision"),
             tf.keras.metrics.Recall(name="recall"),
