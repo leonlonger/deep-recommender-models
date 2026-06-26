@@ -61,7 +61,7 @@ ID_LIKE_COLUMNS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.yaml", help="Path to training config YAML.")
-    parser.add_argument("--limit", type=int, help="Override BigQuery row limit.")
+    parser.add_argument("--limit", type=int, help="Override row limit for the configured data source.")
     parser.add_argument("--label-column", help="Override label column from config.")
     parser.add_argument("--epochs", type=int, help="Override number of training epochs.")
     parser.add_argument("--output-dir", help="Override training output directory.")
@@ -86,6 +86,13 @@ def load_config(path: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError(f"Config must be a YAML mapping: {path}")
     return config
+
+
+def resolve_path(path_value: Any, *, base_dir: Path | None = None) -> Path:
+    path = Path(str(path_value)).expanduser()
+    if not path.is_absolute() and base_dir is not None:
+        path = base_dir / path
+    return path
 
 
 def as_string_list(value: Any) -> list[str]:
@@ -128,6 +135,16 @@ def build_bigquery_sql(data_config: dict[str, Any]) -> str:
     return sql
 
 
+def get_bigquery_config(data_config: dict[str, Any]) -> dict[str, Any]:
+    bigquery_config = data_config.get("bigquery")
+    if isinstance(bigquery_config, dict):
+        merged_config = dict(bigquery_config)
+        if data_config.get("row_limit") is not None and merged_config.get("row_limit") is None:
+            merged_config["row_limit"] = data_config["row_limit"]
+        return merged_config
+    return data_config
+
+
 def load_bigquery_dataframe(data_config: dict[str, Any]) -> pd.DataFrame:
     try:
         from google.cloud import bigquery
@@ -145,16 +162,77 @@ def load_bigquery_dataframe(data_config: dict[str, Any]) -> pd.DataFrame:
     return client.query(sql).result().to_dataframe()
 
 
-def load_dataframe(config: dict[str, Any]) -> pd.DataFrame:
+def apply_row_limit(dataframe: pd.DataFrame, data_config: dict[str, Any]) -> pd.DataFrame:
+    row_limit = data_config.get("row_limit")
+    if row_limit:
+        return dataframe.head(int(row_limit)).copy()
+    return dataframe
+
+
+def read_parquet_dataframe(path: Path, data_config: dict[str, Any]) -> pd.DataFrame:
+    row_limit = data_config.get("row_limit")
+    if not row_limit:
+        return pd.read_parquet(path)
+
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        return pd.read_parquet(path).head(int(row_limit)).copy()
+
+    limit = int(row_limit)
+    tables: list[pa.Table] = []
+    total_rows = 0
+    parquet_file = pq.ParquetFile(path)
+    for batch in parquet_file.iter_batches(batch_size=min(limit, 100_000)):
+        table = pa.Table.from_batches([batch])
+        remaining = limit - total_rows
+        if table.num_rows > remaining:
+            table = table.slice(0, remaining)
+        tables.append(table)
+        total_rows += table.num_rows
+        if total_rows >= limit:
+            break
+
+    if not tables:
+        return pd.DataFrame()
+    return pa.concat_tables(tables).to_pandas()
+
+
+def load_local_dataframe(data_config: dict[str, Any], *, config_path: Path | None = None) -> pd.DataFrame:
+    local_path = data_config.get("path")
+    if not local_path:
+        raise ValueError("data.path is required for local data sources.")
+
+    base_dir = config_path.parent if config_path is not None else None
+    path = resolve_path(local_path, base_dir=base_dir)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Local training data not found: {path}. "
+            "Run scripts/dump_bigquery_data.py to dump the BigQuery table first."
+        )
+
+    source = str(data_config.get("source", "")).lower()
+    suffix = path.suffix.lower()
+    if source == "csv" or suffix == ".csv":
+        dataframe = pd.read_csv(path)
+    elif source in {"parquet", "local"} or suffix in {".parquet", ".pq"}:
+        dataframe = read_parquet_dataframe(path, data_config)
+    else:
+        raise ValueError(
+            f"Cannot infer local data format for {path}. "
+            "Set data.source to parquet or csv."
+        )
+    return apply_row_limit(dataframe, data_config)
+
+
+def load_dataframe(config: dict[str, Any], *, config_path: Path | None = None) -> pd.DataFrame:
     data_config = config.get("data", {})
     source = str(data_config.get("source", "bigquery")).lower()
     if source == "bigquery":
-        return load_bigquery_dataframe(data_config)
-    if source == "csv":
-        csv_path = data_config.get("path")
-        if not csv_path:
-            raise ValueError("data.path is required for CSV source.")
-        return pd.read_csv(Path(csv_path).expanduser())
+        return load_bigquery_dataframe(get_bigquery_config(data_config))
+    if source in {"csv", "parquet", "local"}:
+        return load_local_dataframe(data_config, config_path=config_path)
     raise ValueError(f"Unsupported data.source: {source}")
 
 
@@ -441,10 +519,11 @@ def run_inspection(dataframe: pd.DataFrame, config: dict[str, Any], args: argpar
 
 def main() -> None:
     args = parse_args()
-    config = load_config(Path(args.config))
+    config_path = Path(args.config)
+    config = load_config(config_path)
     apply_cli_overrides(config, args)
 
-    dataframe = load_dataframe(config)
+    dataframe = load_dataframe(config, config_path=config_path)
     if dataframe.empty:
         raise ValueError("Loaded dataframe is empty.")
 

@@ -1,17 +1,18 @@
 # Homepage Recommendation
 
-首页推荐 DNN 排序模型，基于 TensorFlow/Keras 和 BigQuery 训练数据。
+首页推荐 DNN 排序模型，基于 TensorFlow/Keras 和本地 Parquet 训练数据。
 
-默认数据源：
+BigQuery dump 源：
 
 - Project: `phia-prod-416420`
 - Table: `phia-prod-416420.ml.recommendation_metadata_training_examples`
 
 ## 文件说明
 
-- `main.py`: BigQuery/CSV 数据读取、字段推断、训练、评估和模型导出入口。
+- `main.py`: 本地 Parquet/CSV 数据读取、字段推断、训练、评估和模型导出入口。
 - `model.py`: TensorFlow DNN 排序模型与 `tf.data` 数据集构造。
 - `config.yaml`: 数据源、label、特征、模型和训练参数。
+- `scripts/dump_bigquery_data.py`: 将 BigQuery 训练表导出为本地 Parquet。
 - `requirements.txt`: 运行依赖。
 
 ## 安装依赖
@@ -29,6 +30,32 @@ python3 -m venv .venv
 
 如果本机没有 `pip`，先在项目目录外创建一个支持 TensorFlow 的 Python 环境，再安装依赖。
 
+## Dump 训练数据
+
+默认训练数据路径是：
+
+- `/mnt/disk/datasets/homepage_training_examples.parquet`
+
+这个文件不会提交到 git。第一次训练前，先从 BigQuery dump 到本地：
+
+```bash
+.venv/bin/python scripts/dump_bigquery_data.py
+```
+
+脚本会读取 `config.yaml` 里的 `data.bigquery` 配置和 `selected_columns`，默认不加 `LIMIT`，因此会导出当前表里的完整训练数据。小样本调试可以显式限制行数：
+
+```bash
+.venv/bin/python scripts/dump_bigquery_data.py --limit 5000 --output /tmp/homepage_sample.parquet
+```
+
+脚本默认把 BigQuery Storage API 限制为单 stream、单队列，并先写 `.tmp` 文件，完整写完后才替换正式 Parquet。小内存机器上不要随意调大 `--max-stream-count`。
+
+如果要先检查 BigQuery 查询预计扫描量：
+
+```bash
+.venv/bin/python scripts/dump_bigquery_data.py --dry-run
+```
+
 ## GCP 认证
 
 ```bash
@@ -38,7 +65,7 @@ gcloud auth application-default login \
 gcloud config set project phia-prod-416420
 ```
 
-运行账号需要有读取 BigQuery 表的权限。`gcloud auth login` 给 `bq` CLI 使用，`gcloud auth application-default login` 给 Python BigQuery client 使用。
+运行账号需要有读取 BigQuery 表的权限。`gcloud auth login` 给 `bq` CLI 使用，`gcloud auth application-default login` 给 Python BigQuery client 和 dump 脚本使用。
 
 ## 先检查表结构
 
@@ -46,7 +73,7 @@ gcloud config set project phia-prod-416420
 .venv/bin/python main.py --inspect
 ```
 
-`--inspect` 会默认读取 `config.yaml` 里的 `data.inspect_row_limit` 行样本，打印字段类型，并尝试推断：
+`--inspect` 会默认从本地 Parquet 读取 `config.yaml` 里的 `data.inspect_row_limit` 行样本，打印字段类型，并尝试推断：
 
 - label: 优先使用 `label.column`，为空时尝试 `label`、`clicked`、`is_click`、`conversion` 等常见字段。
 - 数值特征: 数值类型列。
@@ -77,6 +104,8 @@ features:
 ```bash
 .venv/bin/python main.py
 ```
+
+训练默认只读取本地 `data.path`，不会访问 BigQuery。
 
 GPU 训练使用封装脚本，它会自动把 `.venv` 中的 CUDA/cuDNN 动态库加入 `LD_LIBRARY_PATH`：
 
