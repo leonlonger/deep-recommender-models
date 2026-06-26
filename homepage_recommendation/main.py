@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-column", help="Override label column from config.")
     parser.add_argument("--epochs", type=int, help="Override number of training epochs.")
     parser.add_argument("--output-dir", help="Override training output directory.")
+    parser.add_argument("--tensorboard-log-dir", help="Override TensorBoard base log directory.")
+    parser.add_argument(
+        "--disable-tensorboard",
+        action="store_true",
+        help="Train without writing TensorBoard event logs.",
+    )
     parser.add_argument(
         "--skip-export",
         action="store_true",
@@ -455,6 +462,47 @@ def serializable_history(history: tf.keras.callbacks.History) -> dict[str, list[
     }
 
 
+def resolve_tensorboard_log_dir(
+    tensorboard_config: dict[str, Any],
+    output_dir: Path,
+) -> Path:
+    base_log_dir = resolve_path(
+        tensorboard_config.get("log_dir", output_dir / "tensorboard"),
+    )
+    run_name = tensorboard_config.get("run_name")
+    if not run_name or str(run_name).lower() == "auto":
+        run_name = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return base_log_dir / str(run_name)
+
+
+def build_tensorboard_callback(
+    tensorboard_config: dict[str, Any],
+    output_dir: Path,
+) -> tf.keras.callbacks.TensorBoard | None:
+    if not tensorboard_config.get("enabled", True):
+        return None
+
+    log_dir = resolve_tensorboard_log_dir(tensorboard_config, output_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    tensorboard_config["resolved_log_dir"] = str(log_dir)
+    print(f"TensorBoard log dir: {log_dir}")
+
+    try:
+        return tf.keras.callbacks.TensorBoard(
+            log_dir=str(log_dir),
+            histogram_freq=int(tensorboard_config.get("histogram_freq", 0)),
+            write_graph=bool(tensorboard_config.get("write_graph", True)),
+            write_images=bool(tensorboard_config.get("write_images", False)),
+            update_freq=tensorboard_config.get("update_freq", "epoch"),
+            profile_batch=tensorboard_config.get("profile_batch", 0),
+        )
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        raise SystemExit(
+            "Missing dependency tensorboard. Install dependencies with: "
+            "pip install -r requirements.txt"
+        ) from exc
+
+
 def export_model(
     model: tf.keras.Model,
     output_dir: Path,
@@ -495,6 +543,7 @@ def export_model(
 def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
     data_config = config.setdefault("data", {})
     training_config = config.setdefault("training", {})
+    tensorboard_config = training_config.setdefault("tensorboard", {})
     if args.limit is not None:
         data_config["row_limit"] = args.limit
     elif args.inspect:
@@ -504,6 +553,10 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> Non
         training_config["epochs"] = args.epochs
     if args.output_dir:
         training_config["output_dir"] = args.output_dir
+    if args.tensorboard_log_dir:
+        tensorboard_config["log_dir"] = args.tensorboard_log_dir
+    if args.disable_tensorboard:
+        tensorboard_config["enabled"] = False
 
 
 def run_inspection(dataframe: pd.DataFrame, config: dict[str, Any], args: argparse.Namespace) -> None:
@@ -593,6 +646,12 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     monitor = "val_auc" if validation_dataset is not None else "auc"
     callbacks: list[tf.keras.callbacks.Callback] = []
+    tensorboard_callback = build_tensorboard_callback(
+        training_config.setdefault("tensorboard", {}),
+        output_dir,
+    )
+    if tensorboard_callback is not None:
+        callbacks.append(tensorboard_callback)
     if not args.skip_export:
         callbacks.append(tf.keras.callbacks.ModelCheckpoint(
             filepath=str(output_dir / "best.keras"),

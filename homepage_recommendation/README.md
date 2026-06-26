@@ -106,6 +106,7 @@ features:
 ```
 
 训练默认只读取本地 `data.path`，不会访问 BigQuery。
+训练时会默认写 TensorBoard event logs 到 `models/homepage_dnn/tensorboard/<UTC时间戳>/`，终端里也会打印实际的 `TensorBoard log dir`。
 
 GPU 训练使用封装脚本，它会自动把 `.venv` 中的 CUDA/cuDNN 动态库加入 `LD_LIBRARY_PATH`：
 
@@ -120,6 +121,18 @@ scripts/train_gpu.sh
 scripts/train_gpu.sh --limit 5000 --epochs 1 --skip-export
 ```
 
+如果想把 TensorBoard 日志写到别的位置：
+
+```bash
+.venv/bin/python main.py --tensorboard-log-dir /tmp/homepage_tensorboard
+```
+
+临时关闭 TensorBoard：
+
+```bash
+.venv/bin/python main.py --disable-tensorboard
+```
+
 训练完成后会输出：
 
 - `models/homepage_dnn/best.keras`
@@ -132,6 +145,28 @@ scripts/train_gpu.sh --limit 5000 --epochs 1 --skip-export
 ```bash
 .venv/bin/python main.py --output-dir /tmp/homepage_dnn
 ```
+
+## 本地查看 TensorBoard
+
+如果 `.venv` 是之前创建的，先更新依赖：
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+先启动一次训练，等终端出现 `TensorBoard log dir: ...` 后，另开一个终端运行：
+
+```bash
+.venv/bin/tensorboard --logdir models/homepage_dnn/tensorboard --host 127.0.0.1 --port 6006
+```
+
+然后在浏览器打开：
+
+```text
+http://127.0.0.1:6006
+```
+
+如果训练时用了自定义日志目录，例如 `--tensorboard-log-dir /tmp/homepage_tensorboard`，启动 TensorBoard 时也把 `--logdir` 换成同一个目录。
 
 ## 本地 CSV 调试
 

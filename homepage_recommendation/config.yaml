@@ -100,3 +100,12 @@ training:
   early_stopping_patience: 2
   class_weight: balanced
   output_dir: models/homepage_dnn
+  tensorboard:
+    enabled: true
+    log_dir: models/homepage_dnn/tensorboard
+    run_name: auto
+    histogram_freq: 0
+    write_graph: true
+    write_images: false
+    update_freq: epoch
+    profile_batch: 0
