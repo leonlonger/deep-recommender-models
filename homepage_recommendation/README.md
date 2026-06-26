@@ -108,6 +108,20 @@ features:
 训练默认只读取本地 `data.path`，不会访问 BigQuery。
 训练时会默认写 TensorBoard event logs 到 `models/homepage_dnn/tensorboard/<UTC时间戳>/`，终端里也会打印实际的 `TensorBoard log dir`。
 
+本地 Parquet 训练默认启用 streaming，会先读取 `data.inspect_row_limit` 行样本推断 schema，然后用 `data.streaming_batch_rows` 分块扫描 Parquet、统计 normalizer/class weight、再分块喂给 TensorFlow。这样不会把 20GB+ Parquet 一次性读进 pandas。可以在 `config.yaml` 调整每块行数：
+
+```yaml
+data:
+  streaming: true
+  streaming_batch_rows: 100000
+```
+
+如果要临时回到旧的 pandas 全量读取路径：
+
+```bash
+.venv/bin/python main.py --no-streaming
+```
+
 GPU 训练使用封装脚本，它会自动把 `.venv` 中的 CUDA/cuDNN 动态库加入 `LD_LIBRARY_PATH`：
 
 ```bash
