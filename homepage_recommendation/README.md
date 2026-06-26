@@ -116,6 +116,42 @@ data:
   streaming_batch_rows: 100000
 ```
 
+## 先离线预处理再训练
+
+如果不想每次训练都重复做 label 清洗、类型转换、train/validation 切分和统计，可以先把原始 Parquet 处理成一个新的训练数据集：
+
+```bash
+.venv/bin/python main.py \
+  --preprocess-output /mnt/disk/datasets/homepage_training_preprocessed \
+  --overwrite-preprocessed
+```
+
+这个目录会包含：
+
+- `train.parquet`
+- `validation.parquet`
+- `metadata.json`
+- `training_config.yaml`
+
+之后直接用生成的配置训练：
+
+```bash
+.venv/bin/python main.py --config /mnt/disk/datasets/homepage_training_preprocessed/training_config.yaml
+```
+
+小样本验证可以加 `--limit`：
+
+```bash
+.venv/bin/python main.py \
+  --limit 5000 \
+  --preprocess-output /tmp/homepage_training_preprocessed_sample \
+  --overwrite-preprocessed
+.venv/bin/python main.py \
+  --config /tmp/homepage_training_preprocessed_sample/training_config.yaml \
+  --epochs 1 \
+  --skip-export
+```
+
 如果要临时回到旧的 pandas 全量读取路径：
 
 ```bash

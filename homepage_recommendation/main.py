@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 from datetime import datetime, timezone
@@ -92,6 +93,18 @@ def parse_args() -> argparse.Namespace:
         "--inspect",
         action="store_true",
         help="Load a small sample and print inferred schema without training.",
+    )
+    parser.add_argument(
+        "--preprocess-output",
+        help=(
+            "Prepare the configured streaming Parquet data once and write train/validation "
+            "Parquet files plus metadata to this directory, then exit."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite-preprocessed",
+        action="store_true",
+        help="Allow --preprocess-output to replace existing preprocessed files in the output directory.",
     )
     return parser.parse_args()
 
@@ -360,6 +373,22 @@ def infer_feature_spec(
     )
 
 
+def feature_spec_from_dict(value: dict[str, Any]) -> FeatureSpec:
+    return FeatureSpec(
+        label_column=str(value["label_column"]),
+        numeric_columns=tuple(str(column) for column in value.get("numeric_columns", [])),
+        categorical_columns=tuple(str(column) for column in value.get("categorical_columns", [])),
+    )
+
+
+def feature_columns(feature_spec: FeatureSpec) -> list[str]:
+    return [
+        feature_spec.label_column,
+        *feature_spec.numeric_columns,
+        *feature_spec.categorical_columns,
+    ]
+
+
 def coerce_binary_label(series: pd.Series, positive_threshold: float | None) -> pd.Series:
     numeric = pd.to_numeric(series, errors="coerce")
     if numeric.isna().any():
@@ -396,6 +425,31 @@ def coerce_binary_label(series: pd.Series, positive_threshold: float | None) -> 
     return numeric
 
 
+def is_missing_scalar(value: Any) -> bool:
+    if value is None or value is pd.NA or value is pd.NaT:
+        return True
+    if isinstance(value, (float, np.floating)):
+        return bool(np.isnan(value))
+    return False
+
+
+def categorical_value_to_string(value: Any) -> str:
+    if is_missing_scalar(value):
+        return ""
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, tuple, set)):
+        return "|".join(categorical_value_to_string(item) for item in value)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return str(value)
+
+
+def coerce_categorical_series(series: pd.Series) -> pd.Series:
+    values = series.astype("object")
+    return values.map(categorical_value_to_string)
+
+
 def prepare_dataframe(
     dataframe: pd.DataFrame,
     feature_spec: FeatureSpec,
@@ -429,8 +483,7 @@ def prepare_dataframe(
         prepared[column] = values.astype("float32")
 
     for column in feature_spec.categorical_columns:
-        values = prepared[column].astype("object")
-        prepared[column] = values.where(values.notna(), "").astype(str)
+        prepared[column] = coerce_categorical_series(prepared[column])
 
     return prepared, dropped_rows
 
@@ -598,6 +651,116 @@ def parquet_batches_to_dataframes(
             break
 
 
+def parquet_row_count(path: Path) -> int:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        raise SystemExit("Missing dependency pyarrow. Install dependencies with: pip install -r requirements.txt") from exc
+
+    return int(pq.ParquetFile(path).metadata.num_rows)
+
+
+def write_preprocessed_frame(
+    prepared: pd.DataFrame,
+    *,
+    split_name: str,
+    output_dir: Path,
+    writers: dict[str, Any],
+) -> None:
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        raise SystemExit("Missing dependency pyarrow. Install dependencies with: pip install -r requirements.txt") from exc
+
+    table = pa.Table.from_pandas(prepared, preserve_index=False)
+    writer = writers.get(split_name)
+    if writer is None:
+        writer = pq.ParquetWriter(
+            output_dir / f"{split_name}.parquet",
+            table.schema,
+            compression="zstd",
+        )
+        writers[split_name] = writer
+    writer.write_table(table)
+
+
+def close_parquet_writers(writers: dict[str, Any]) -> None:
+    for writer in writers.values():
+        writer.close()
+
+
+def serializable_preprocessing_stats(stats: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "rows": int(stats["rows"]),
+        "train_rows": int(stats["train_rows"]),
+        "validation_rows": int(stats["validation_rows"]),
+        "dropped_rows": int(stats["dropped_rows"]),
+        "train_positives": float(stats["train_positives"]),
+        "numeric_sum": [float(value) for value in stats["numeric_sum"]],
+        "numeric_sum_squares": [float(value) for value in stats["numeric_sum_squares"]],
+    }
+
+
+def preprocessing_stats_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    stats = dict(metadata["stats"])
+    stats["numeric_sum"] = np.array(stats.get("numeric_sum", []), dtype="float64")
+    stats["numeric_sum_squares"] = np.array(stats.get("numeric_sum_squares", []), dtype="float64")
+    return stats
+
+
+def load_preprocessed_metadata(data_dir: Path) -> dict[str, Any]:
+    metadata_path = data_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Preprocessed metadata not found: {metadata_path}")
+    return json.loads(metadata_path.read_text(encoding="utf-8"))
+
+
+def is_preprocessed_parquet_training(config: dict[str, Any]) -> bool:
+    data_config = config.get("data", {})
+    source = str(data_config.get("source", "")).lower()
+    return source in {"preprocessed_parquet", "prepared_parquet"} or bool(data_config.get("preprocessed"))
+
+
+def resolve_preprocessed_data_dir(data_config: dict[str, Any], *, config_path: Path | None = None) -> Path:
+    local_path = data_config.get("path")
+    if not local_path:
+        raise ValueError("data.path is required for preprocessed Parquet data.")
+    base_dir = config_path.parent if config_path is not None else None
+    path = resolve_path(local_path, base_dir=base_dir)
+    if not path.exists():
+        raise FileNotFoundError(f"Preprocessed data directory not found: {path}")
+    if not path.is_dir():
+        raise ValueError(f"Preprocessed data.path must be a directory: {path}")
+    return path
+
+
+def build_preprocessed_training_config(
+    config: dict[str, Any],
+    *,
+    output_dir: Path,
+    feature_spec: FeatureSpec,
+) -> dict[str, Any]:
+    prepared_config = copy.deepcopy(config)
+    data_config = prepared_config.setdefault("data", {})
+    data_config.clear()
+    data_config.update(
+        {
+            "source": "preprocessed_parquet",
+            "path": str(output_dir),
+            "streaming_batch_rows": int(config.get("data", {}).get("streaming_batch_rows", 100_000)),
+        }
+    )
+    prepared_config.setdefault("label", {})["column"] = feature_spec.label_column
+    prepared_config["features"] = {
+        **prepared_config.get("features", {}),
+        "auto_infer": False,
+        "numeric_columns": list(feature_spec.numeric_columns),
+        "categorical_columns": list(feature_spec.categorical_columns),
+    }
+    return prepared_config
+
+
 def prepared_streaming_frames(
     path: Path,
     feature_spec: FeatureSpec,
@@ -719,6 +882,114 @@ def build_streaming_dataset(
             include_sample_weight=class_weight is not None,
         ),
     ).prefetch(tf.data.AUTOTUNE)
+
+
+def preprocessed_streaming_frames(
+    path: Path,
+    feature_spec: FeatureSpec,
+    *,
+    parquet_batch_rows: int,
+    row_limit: int | None,
+    shuffle: bool = False,
+    seed: int,
+) -> Iterator[pd.DataFrame]:
+    for batch_index, (dataframe, _) in enumerate(
+        parquet_batches_to_dataframes(
+            path,
+            feature_columns(feature_spec),
+            parquet_batch_rows=parquet_batch_rows,
+            row_limit=row_limit,
+        )
+    ):
+        if dataframe.empty:
+            continue
+        if shuffle:
+            dataframe = dataframe.sample(frac=1.0, random_state=seed + batch_index).reset_index(drop=True)
+        yield dataframe
+
+
+def build_preprocessed_dataset(
+    path: Path,
+    feature_spec: FeatureSpec,
+    *,
+    parquet_batch_rows: int,
+    row_limit: int | None,
+    seed: int,
+    batch_size: int,
+    shuffle: bool,
+    class_weight: dict[int, float] | None = None,
+) -> tf.data.Dataset:
+    def generator() -> Iterator[Any]:
+        for prepared in preprocessed_streaming_frames(
+            path,
+            feature_spec,
+            parquet_batch_rows=parquet_batch_rows,
+            row_limit=row_limit,
+            shuffle=shuffle,
+            seed=seed,
+        ):
+            for start in range(0, len(prepared), batch_size):
+                batch = prepared.iloc[start : start + batch_size]
+                features, labels = dataframe_to_batch_arrays(batch, feature_spec)
+                if class_weight is not None:
+                    weights = np.where(labels >= 0.5, class_weight[1], class_weight[0]).astype("float32")
+                    yield features, labels, weights
+                else:
+                    yield features, labels
+
+    return tf.data.Dataset.from_generator(
+        generator,
+        output_signature=streaming_output_signature(
+            feature_spec,
+            include_sample_weight=class_weight is not None,
+        ),
+    ).prefetch(tf.data.AUTOTUNE)
+
+
+def collect_preprocessed_training_stats(
+    train_path: Path,
+    validation_path: Path | None,
+    feature_spec: FeatureSpec,
+    *,
+    parquet_batch_rows: int,
+    row_limit: int | None,
+) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "rows": 0,
+        "train_rows": 0,
+        "validation_rows": 0,
+        "dropped_rows": 0,
+        "train_positives": 0.0,
+        "numeric_sum": np.zeros(len(feature_spec.numeric_columns), dtype="float64"),
+        "numeric_sum_squares": np.zeros(len(feature_spec.numeric_columns), dtype="float64"),
+    }
+
+    for dataframe, _ in parquet_batches_to_dataframes(
+        train_path,
+        feature_columns(feature_spec),
+        parquet_batch_rows=parquet_batch_rows,
+        row_limit=row_limit,
+    ):
+        row_count = len(dataframe)
+        stats["rows"] += row_count
+        stats["train_rows"] += row_count
+        labels = pd.to_numeric(dataframe[feature_spec.label_column], errors="coerce").fillna(0.0)
+        stats["train_positives"] += float((labels >= 0.5).sum())
+        if feature_spec.numeric_columns:
+            numeric_values = dataframe.loc[:, feature_spec.numeric_columns].to_numpy(dtype="float64")
+            stats["numeric_sum"] += numeric_values.sum(axis=0)
+            stats["numeric_sum_squares"] += np.square(numeric_values).sum(axis=0)
+
+    if validation_path is not None and validation_path.exists() and row_limit is None:
+        stats["validation_rows"] = parquet_row_count(validation_path)
+        stats["rows"] += stats["validation_rows"]
+    elif validation_path is not None and validation_path.exists():
+        stats["validation_rows"] = min(parquet_row_count(validation_path), int(row_limit))
+        stats["rows"] += stats["validation_rows"]
+
+    if stats["train_rows"] <= 0:
+        raise ValueError("No preprocessed training rows remain.")
+    return stats
 
 
 def collect_streaming_training_stats(
@@ -917,6 +1188,178 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> Non
         data_config["streaming"] = False
 
 
+def run_streaming_preprocessing(
+    config: dict[str, Any],
+    *,
+    config_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    data_config = config.get("data", {})
+    if not is_streaming_parquet_training(config, config_path=config_path):
+        raise ValueError("--preprocess-output currently requires data.source parquet/local with data.streaming true.")
+
+    source_path = resolve_local_data_path(data_config, config_path=config_path)
+    output_dir = resolve_path(args.preprocess_output, base_dir=config_path.parent).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    known_outputs = [
+        output_dir / "train.parquet",
+        output_dir / "validation.parquet",
+        output_dir / "metadata.json",
+        output_dir / "training_config.yaml",
+    ]
+    existing_outputs = [path for path in known_outputs if path.exists()]
+    if existing_outputs and not args.overwrite_preprocessed:
+        existing = ", ".join(str(path) for path in existing_outputs)
+        raise FileExistsError(
+            "Preprocessed output already exists. Pass --overwrite-preprocessed to replace: "
+            f"{existing}"
+        )
+    if args.overwrite_preprocessed:
+        for path in existing_outputs:
+            path.unlink()
+
+    sample_dataframe = streaming_schema_sample(source_path, data_config)
+    if sample_dataframe.empty:
+        raise ValueError("Loaded streaming schema sample is empty.")
+
+    label_column = resolve_label_column(sample_dataframe, config, args.label_column)
+    feature_spec = infer_feature_spec(sample_dataframe, config, label_column)
+
+    training_config = config.get("training", {})
+    seed = int(training_config.get("seed", 42))
+    validation_fraction = float(training_config.get("validation_fraction", 0.2))
+    parquet_batch_rows = int(data_config.get("streaming_batch_rows", 100_000))
+    if parquet_batch_rows <= 0:
+        raise ValueError("data.streaming_batch_rows must be positive.")
+    row_limit = int(data_config["row_limit"]) if data_config.get("row_limit") else None
+
+    stats: dict[str, Any] = {
+        "rows": 0,
+        "train_rows": 0,
+        "validation_rows": 0,
+        "dropped_rows": 0,
+        "train_positives": 0.0,
+        "numeric_sum": np.zeros(len(feature_spec.numeric_columns), dtype="float64"),
+        "numeric_sum_squares": np.zeros(len(feature_spec.numeric_columns), dtype="float64"),
+    }
+    writers: dict[str, Any] = {}
+
+    print(f"Preprocessing streaming Parquet from: {source_path}", flush=True)
+    print(f"Writing preprocessed dataset to: {output_dir}", flush=True)
+    print(f"Parquet batch rows: {parquet_batch_rows}", flush=True)
+    if row_limit:
+        print(f"Row limit: {row_limit}", flush=True)
+    print_feature_summary(feature_spec)
+
+    try:
+        for batch_index, (dataframe, row_indices) in enumerate(
+            parquet_batches_to_dataframes(
+                source_path,
+                feature_columns(feature_spec),
+                parquet_batch_rows=parquet_batch_rows,
+                row_limit=row_limit,
+            ),
+            start=1,
+        ):
+            stats["rows"] += len(dataframe)
+            if validation_fraction > 0.0:
+                validation_mask = validation_mask_for_indices(
+                    row_indices,
+                    validation_fraction=validation_fraction,
+                    seed=seed,
+                )
+            else:
+                validation_mask = np.zeros(len(dataframe), dtype=bool)
+
+            for split_name, mask in (
+                ("train", ~validation_mask),
+                ("validation", validation_mask),
+            ):
+                if not mask.any():
+                    continue
+                prepared, dropped_rows = prepare_streaming_dataframe(
+                    dataframe.loc[mask].reset_index(drop=True),
+                    feature_spec,
+                    config,
+                )
+                stats["dropped_rows"] += dropped_rows
+                if prepared.empty:
+                    continue
+
+                row_count = len(prepared)
+                if split_name == "train":
+                    stats["train_rows"] += row_count
+                    labels = prepared[feature_spec.label_column]
+                    stats["train_positives"] += float((labels >= 0.5).sum())
+                    if feature_spec.numeric_columns:
+                        numeric_values = prepared.loc[:, feature_spec.numeric_columns].to_numpy(dtype="float64")
+                        stats["numeric_sum"] += numeric_values.sum(axis=0)
+                        stats["numeric_sum_squares"] += np.square(numeric_values).sum(axis=0)
+                else:
+                    stats["validation_rows"] += row_count
+
+                write_preprocessed_frame(
+                    prepared,
+                    split_name=split_name,
+                    output_dir=output_dir,
+                    writers=writers,
+                )
+
+            print(
+                "Processed batch "
+                f"{batch_index}: source rows={stats['rows']}, "
+                f"train rows={stats['train_rows']}, "
+                f"validation rows={stats['validation_rows']}, "
+                f"dropped rows={stats['dropped_rows']}",
+                flush=True,
+            )
+    finally:
+        close_parquet_writers(writers)
+
+    if stats["train_rows"] <= 0:
+        raise ValueError("No training rows remain after preprocessing.")
+
+    metadata = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source_path": str(source_path),
+        "feature_spec": feature_spec.to_dict(),
+        "stats": serializable_preprocessing_stats(stats),
+        "validation_fraction": validation_fraction,
+        "seed": seed,
+        "parquet_batch_rows": parquet_batch_rows,
+        "row_limit": row_limit,
+    }
+    metadata_path = output_dir / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    prepared_config = build_preprocessed_training_config(
+        config,
+        output_dir=output_dir,
+        feature_spec=feature_spec,
+    )
+    training_config_path = output_dir / "training_config.yaml"
+    training_config_path.write_text(
+        yaml.safe_dump(prepared_config, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    print("Preprocessed dataset written:", flush=True)
+    print(f"  train: {output_dir / 'train.parquet'}", flush=True)
+    if stats["validation_rows"]:
+        print(f"  validation: {output_dir / 'validation.parquet'}", flush=True)
+    print(f"  metadata: {metadata_path}", flush=True)
+    print(f"  training_config: {training_config_path}", flush=True)
+    print(
+        "Train with: "
+        f"{Path('.venv/bin/python')} main.py --config {training_config_path}",
+        flush=True,
+    )
+
+
 def build_training_callbacks(
     training_config: dict[str, Any],
     output_dir: Path,
@@ -1100,6 +1543,150 @@ def run_streaming_training(
     )
 
 
+def run_preprocessed_training(
+    config: dict[str, Any],
+    *,
+    config_path: Path,
+    args: argparse.Namespace,
+) -> None:
+    data_config = config.get("data", {})
+    data_dir = resolve_preprocessed_data_dir(data_config, config_path=config_path)
+    metadata = load_preprocessed_metadata(data_dir)
+    feature_spec = feature_spec_from_dict(metadata["feature_spec"])
+
+    train_path = data_dir / "train.parquet"
+    validation_path = data_dir / "validation.parquet"
+    if not train_path.exists():
+        raise FileNotFoundError(f"Preprocessed train split not found: {train_path}")
+    if not validation_path.exists():
+        validation_path = None
+
+    training_config = config.get("training", {})
+    model_config = config.get("model", {})
+    features_config = config.get("features", {})
+
+    seed = int(training_config.get("seed", metadata.get("seed", 42)))
+    batch_size = int(training_config.get("batch_size", 1024))
+    parquet_batch_rows = int(data_config.get("streaming_batch_rows", metadata.get("parquet_batch_rows", 100_000)))
+    if parquet_batch_rows <= 0:
+        raise ValueError("data.streaming_batch_rows must be positive.")
+    row_limit = int(data_config["row_limit"]) if data_config.get("row_limit") else None
+
+    if row_limit is None:
+        stats = preprocessing_stats_from_metadata(metadata)
+    else:
+        stats = collect_preprocessed_training_stats(
+            train_path,
+            validation_path,
+            feature_spec,
+            parquet_batch_rows=parquet_batch_rows,
+            row_limit=row_limit,
+        )
+
+    print(f"Training from preprocessed dataset: {data_dir}", flush=True)
+    print(f"Parquet batch rows: {parquet_batch_rows}", flush=True)
+    if row_limit:
+        print(f"Row limit per split: {row_limit}", flush=True)
+
+    print_feature_summary(feature_spec, train_size=int(stats["rows"]))
+    if int(stats["validation_rows"]):
+        print(f"Train rows: {stats['train_rows']}, validation rows: {stats['validation_rows']}")
+    else:
+        print(f"Train rows: {stats['train_rows']}, validation disabled")
+
+    numeric_normalizer = build_numeric_normalizer_from_stats(
+        feature_spec.numeric_columns,
+        stats["numeric_sum"],
+        stats["numeric_sum_squares"],
+        int(stats["train_rows"]),
+    )
+    model = build_homepage_recommendation_model(
+        feature_spec,
+        hidden_units=tuple(int(value) for value in model_config.get("hidden_units", [256, 128, 64])),
+        dropout=float(model_config.get("dropout", 0.2)),
+        learning_rate=float(training_config.get("learning_rate", 0.001)),
+        categorical_hash_bins=int(features_config.get("categorical_hash_bins", 100_000)),
+        embedding_dim=int(features_config.get("embedding_dim", 16)),
+        activation=str(model_config.get("activation", "relu")),
+        l2=float(model_config.get("l2", 0.0)),
+        numeric_normalizer=numeric_normalizer,
+    )
+    model.summary()
+
+    class_weight = build_balanced_class_weight_from_counts(
+        float(stats["train_positives"]),
+        float(stats["train_rows"]),
+        training_config.get("class_weight"),
+    )
+
+    train_dataset = build_preprocessed_dataset(
+        train_path,
+        feature_spec,
+        parquet_batch_rows=parquet_batch_rows,
+        row_limit=row_limit,
+        seed=seed,
+        batch_size=batch_size,
+        shuffle=True,
+        class_weight=class_weight,
+    )
+    validation_dataset = None
+    validation_steps = None
+    if validation_path is not None and int(stats["validation_rows"]) > 0:
+        validation_dataset = build_preprocessed_dataset(
+            validation_path,
+            feature_spec,
+            parquet_batch_rows=parquet_batch_rows,
+            row_limit=row_limit,
+            seed=seed,
+            batch_size=batch_size,
+            shuffle=False,
+        )
+        validation_steps = math.ceil(int(stats["validation_rows"]) / batch_size)
+
+    output_dir = Path(training_config.get("output_dir", "models/homepage_dnn"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    monitor = "val_auc" if validation_dataset is not None else "auc"
+    callbacks = build_training_callbacks(
+        training_config,
+        output_dir,
+        monitor=monitor,
+        skip_export=args.skip_export,
+    )
+
+    steps_per_epoch = math.ceil(int(stats["train_rows"]) / batch_size)
+    history = model.fit(
+        train_dataset,
+        validation_data=validation_dataset,
+        epochs=int(training_config.get("epochs", 10)),
+        callbacks=callbacks,
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=validation_steps,
+    )
+
+    evaluation_dataset = validation_dataset or train_dataset
+    evaluation_steps = validation_steps or steps_per_epoch
+    evaluation = model.evaluate(
+        evaluation_dataset,
+        steps=evaluation_steps,
+        return_dict=True,
+    )
+    print("Evaluation:")
+    print(json.dumps({metric: float(value) for metric, value in evaluation.items()}, indent=2))
+
+    if args.skip_export:
+        print("Skipping model export because --skip-export was set.")
+        return
+
+    export_model(
+        model,
+        output_dir,
+        feature_spec=feature_spec,
+        history=history,
+        evaluation=evaluation,
+        config=config,
+    )
+
+
 def run_inspection(dataframe: pd.DataFrame, config: dict[str, Any], args: argparse.Namespace) -> None:
     print_schema(dataframe)
     try:
@@ -1116,6 +1703,14 @@ def main() -> None:
     config_path = Path(args.config)
     config = load_config(config_path)
     apply_cli_overrides(config, args)
+
+    if args.preprocess_output:
+        run_streaming_preprocessing(config, config_path=config_path, args=args)
+        return
+
+    if not args.inspect and is_preprocessed_parquet_training(config):
+        run_preprocessed_training(config, config_path=config_path, args=args)
+        return
 
     if not args.inspect and is_streaming_parquet_training(config, config_path=config_path):
         run_streaming_training(config, config_path=config_path, args=args)
