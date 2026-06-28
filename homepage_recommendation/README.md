@@ -89,6 +89,15 @@ label:
   positive_threshold: 0
 ```
 
+训练指标和负采样统计默认按 `0.5` 划分模型分数的正负类。这个预测分类阈值可以在 `training.classification_threshold` 调整：
+
+```yaml
+training:
+  classification_threshold: 0.5
+```
+
+注意：`label.positive_threshold` 用于把原始目标列二值化；`training.classification_threshold` 用于把模型输出分数按阈值计入 binary accuracy、precision、recall 和采样统计。
+
 如果自动推断不符合业务语义，可以显式指定：
 
 ```yaml

@@ -60,6 +60,8 @@ ID_LIKE_COLUMNS = {
     "category_id",
 }
 
+DEFAULT_CLASSIFICATION_THRESHOLD = 0.5
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -594,6 +596,18 @@ def describe_negative_sampling(sampling_config: dict[str, str | float]) -> str:
     return f"target negative:positive={value:g}:1"
 
 
+def resolve_classification_threshold(config: dict[str, Any]) -> float:
+    training_config = config.get("training", {})
+    value = training_config.get("classification_threshold", DEFAULT_CLASSIFICATION_THRESHOLD)
+    if value is None:
+        return DEFAULT_CLASSIFICATION_THRESHOLD
+
+    threshold = float(value)
+    if threshold <= 0.0 or threshold >= 1.0:
+        raise ValueError("training.classification_threshold must be in the range (0, 1).")
+    return threshold
+
+
 def target_negatives_for_sampling(
     *,
     positives: int,
@@ -616,9 +630,14 @@ def target_negatives_for_sampling(
     return min(negatives, max(0, target_negatives))
 
 
-def label_counts(prepared: pd.DataFrame, label_column: str) -> tuple[int, int]:
+def label_counts(
+    prepared: pd.DataFrame,
+    label_column: str,
+    *,
+    classification_threshold: float,
+) -> tuple[int, int]:
     labels = prepared[label_column]
-    positives = int((labels >= 0.5).sum())
+    positives = int((labels >= classification_threshold).sum())
     negatives = int(len(labels) - positives)
     return positives, negatives
 
@@ -632,6 +651,7 @@ def collect_streaming_preprocessing_label_counts(
     row_limit: int | None,
     validation_fraction: float,
     seed: int,
+    classification_threshold: float,
 ) -> dict[str, Any]:
     split_counts: dict[str, dict[str, int]] = {
         "train": {"rows": 0, "positives": 0, "negatives": 0},
@@ -672,7 +692,7 @@ def collect_streaming_preprocessing_label_counts(
             if valid_labels.empty:
                 continue
 
-            positives = int((valid_labels >= 0.5).sum())
+            positives = int((valid_labels >= classification_threshold).sum())
             negatives = int(len(valid_labels) - positives)
             split_counts[split_name]["rows"] += len(valid_labels)
             split_counts[split_name]["positives"] += positives
@@ -717,6 +737,7 @@ def apply_negative_downsampling(
     split_name: str,
     sampling_plan: dict[str, dict[str, int | float | bool | str]] | None,
     sampling_state: dict[str, int],
+    classification_threshold: float,
 ) -> pd.DataFrame:
     if not sampling_plan:
         return prepared
@@ -728,7 +749,7 @@ def apply_negative_downsampling(
         return prepared
 
     labels = prepared[label_column]
-    negative_mask = (labels < 0.5).to_numpy(dtype=bool)
+    negative_mask = (labels < classification_threshold).to_numpy(dtype=bool)
     batch_negatives = int(negative_mask.sum())
     if batch_negatives == 0:
         return prepared
@@ -765,10 +786,15 @@ def split_dataframe(
     return train_df, validation_df
 
 
-def build_class_weight(labels: pd.Series, mode: Any) -> dict[int, float] | None:
+def build_class_weight(
+    labels: pd.Series,
+    mode: Any,
+    *,
+    classification_threshold: float,
+) -> dict[int, float] | None:
     if str(mode).lower() != "balanced":
         return None
-    positives = float((labels >= 0.5).sum())
+    positives = float((labels >= classification_threshold).sum())
     total = float(len(labels))
     negatives = total - positives
     if positives == 0.0 or negatives == 0.0:
@@ -1034,6 +1060,7 @@ def prepared_streaming_frames(
     validation_fraction: float,
     seed: int,
     split: str,
+    classification_threshold: float,
     shuffle: bool = False,
     sampling_plan: dict[str, dict[str, int | float | bool | str]] | None = None,
 ) -> Iterator[pd.DataFrame]:
@@ -1076,6 +1103,7 @@ def prepared_streaming_frames(
             split_name=split,
             sampling_plan=sampling_plan,
             sampling_state=sampling_state,
+            classification_threshold=classification_threshold,
         )
         if prepared.empty:
             continue
@@ -1126,8 +1154,10 @@ def build_streaming_dataset(
     split: str,
     batch_size: int,
     shuffle: bool,
+    classification_threshold: float,
     class_weight: dict[int, float] | None = None,
     sampling_plan: dict[str, dict[str, int | float | bool | str]] | None = None,
+    repeat: bool = False,
 ) -> tf.data.Dataset:
     def generator() -> Iterator[Any]:
         for prepared in prepared_streaming_frames(
@@ -1139,6 +1169,7 @@ def build_streaming_dataset(
             validation_fraction=validation_fraction,
             seed=seed,
             split=split,
+            classification_threshold=classification_threshold,
             shuffle=shuffle,
             sampling_plan=sampling_plan,
         ):
@@ -1146,18 +1177,25 @@ def build_streaming_dataset(
                 batch = prepared.iloc[start : start + batch_size]
                 features, labels = dataframe_to_batch_arrays(batch, feature_spec)
                 if class_weight is not None:
-                    weights = np.where(labels >= 0.5, class_weight[1], class_weight[0]).astype("float32")
+                    weights = np.where(
+                        labels >= classification_threshold,
+                        class_weight[1],
+                        class_weight[0],
+                    ).astype("float32")
                     yield features, labels, weights
                 else:
                     yield features, labels
 
-    return tf.data.Dataset.from_generator(
+    dataset = tf.data.Dataset.from_generator(
         generator,
         output_signature=streaming_output_signature(
             feature_spec,
             include_sample_weight=class_weight is not None,
         ),
-    ).prefetch(tf.data.AUTOTUNE)
+    )
+    if repeat:
+        dataset = dataset.repeat()
+    return dataset.prefetch(tf.data.AUTOTUNE)
 
 
 def preprocessed_streaming_frames(
@@ -1193,7 +1231,9 @@ def build_preprocessed_dataset(
     seed: int,
     batch_size: int,
     shuffle: bool,
+    classification_threshold: float,
     class_weight: dict[int, float] | None = None,
+    repeat: bool = False,
 ) -> tf.data.Dataset:
     def generator() -> Iterator[Any]:
         for prepared in preprocessed_streaming_frames(
@@ -1208,18 +1248,25 @@ def build_preprocessed_dataset(
                 batch = prepared.iloc[start : start + batch_size]
                 features, labels = dataframe_to_batch_arrays(batch, feature_spec)
                 if class_weight is not None:
-                    weights = np.where(labels >= 0.5, class_weight[1], class_weight[0]).astype("float32")
+                    weights = np.where(
+                        labels >= classification_threshold,
+                        class_weight[1],
+                        class_weight[0],
+                    ).astype("float32")
                     yield features, labels, weights
                 else:
                     yield features, labels
 
-    return tf.data.Dataset.from_generator(
+    dataset = tf.data.Dataset.from_generator(
         generator,
         output_signature=streaming_output_signature(
             feature_spec,
             include_sample_weight=class_weight is not None,
         ),
-    ).prefetch(tf.data.AUTOTUNE)
+    )
+    if repeat:
+        dataset = dataset.repeat()
+    return dataset.prefetch(tf.data.AUTOTUNE)
 
 
 def collect_preprocessed_training_stats(
@@ -1229,6 +1276,7 @@ def collect_preprocessed_training_stats(
     *,
     parquet_batch_rows: int,
     row_limit: int | None,
+    classification_threshold: float,
 ) -> dict[str, Any]:
     stats: dict[str, Any] = {
         "rows": 0,
@@ -1250,7 +1298,7 @@ def collect_preprocessed_training_stats(
         stats["rows"] += row_count
         stats["train_rows"] += row_count
         labels = pd.to_numeric(dataframe[feature_spec.label_column], errors="coerce").fillna(0.0)
-        stats["train_positives"] += float((labels >= 0.5).sum())
+        stats["train_positives"] += float((labels >= classification_threshold).sum())
         if feature_spec.numeric_columns:
             numeric_values = dataframe.loc[:, feature_spec.numeric_columns].to_numpy(dtype="float64")
             stats["numeric_sum"] += numeric_values.sum(axis=0)
@@ -1277,6 +1325,7 @@ def collect_streaming_training_stats(
     row_limit: int | None,
     validation_fraction: float,
     seed: int,
+    classification_threshold: float,
     sampling_plan: dict[str, dict[str, int | float | bool | str]] | None = None,
 ) -> dict[str, Any]:
     stats: dict[str, Any] = {
@@ -1335,12 +1384,17 @@ def collect_streaming_training_stats(
                 split_name=split_name,
                 sampling_plan=sampling_plan,
                 sampling_state=sampling_state,
+                classification_threshold=classification_threshold,
             )
             if prepared.empty:
                 continue
 
             row_count = len(prepared)
-            positives, negatives = label_counts(prepared, feature_spec.label_column)
+            positives, negatives = label_counts(
+                prepared,
+                feature_spec.label_column,
+                classification_threshold=classification_threshold,
+            )
             stats["rows"] += row_count
             if split_name == "train":
                 stats["train_rows"] += row_count
@@ -1528,6 +1582,7 @@ def run_streaming_preprocessing(
     if parquet_batch_rows <= 0:
         raise ValueError("data.streaming_batch_rows must be positive.")
     row_limit = int(data_config["row_limit"]) if data_config.get("row_limit") else None
+    classification_threshold = resolve_classification_threshold(config)
     negative_sampling_config = resolve_negative_sampling_config(config)
     sampling_counts: dict[str, Any] | None = None
     sampling_plan: dict[str, dict[str, int | float | bool | str]] | None = None
@@ -1545,6 +1600,7 @@ def run_streaming_preprocessing(
             row_limit=row_limit,
             validation_fraction=validation_fraction,
             seed=seed,
+            classification_threshold=classification_threshold,
         )
         sampling_plan = build_negative_downsampling_plan(
             sampling_counts["splits"],
@@ -1631,12 +1687,17 @@ def run_streaming_preprocessing(
                     split_name=split_name,
                     sampling_plan=sampling_plan,
                     sampling_state=sampling_state,
+                    classification_threshold=classification_threshold,
                 )
                 if prepared.empty:
                     continue
 
                 row_count = len(prepared)
-                positives, negatives = label_counts(prepared, feature_spec.label_column)
+                positives, negatives = label_counts(
+                    prepared,
+                    feature_spec.label_column,
+                    classification_threshold=classification_threshold,
+                )
                 stats["rows"] += row_count
                 if split_name == "train":
                     stats["train_rows"] += row_count
@@ -1679,6 +1740,7 @@ def run_streaming_preprocessing(
         "feature_spec": feature_spec.to_dict(),
         "stats": serializable_preprocessing_stats(stats),
         "validation_fraction": validation_fraction,
+        "classification_threshold": classification_threshold,
         "seed": seed,
         "parquet_batch_rows": parquet_batch_rows,
         "row_limit": row_limit,
@@ -1777,6 +1839,7 @@ def run_streaming_training(
     seed = int(training_config.get("seed", 42))
     validation_fraction = float(training_config.get("validation_fraction", 0.2))
     batch_size = int(training_config.get("batch_size", 1024))
+    classification_threshold = resolve_classification_threshold(config)
     parquet_batch_rows = int(data_config.get("streaming_batch_rows", 100_000))
     if parquet_batch_rows <= 0:
         raise ValueError("data.streaming_batch_rows must be positive.")
@@ -1804,6 +1867,7 @@ def run_streaming_training(
             row_limit=row_limit,
             validation_fraction=validation_fraction,
             seed=seed,
+            classification_threshold=classification_threshold,
         )
         sampling_plan = build_negative_downsampling_plan(
             sampling_counts["splits"],
@@ -1829,6 +1893,7 @@ def run_streaming_training(
         row_limit=row_limit,
         validation_fraction=validation_fraction,
         seed=seed,
+        classification_threshold=classification_threshold,
         sampling_plan=sampling_plan,
     )
 
@@ -1857,6 +1922,7 @@ def run_streaming_training(
         hidden_units=tuple(int(value) for value in model_config.get("hidden_units", [256, 128, 64])),
         dropout=float(model_config.get("dropout", 0.2)),
         learning_rate=float(training_config.get("learning_rate", 0.001)),
+        classification_threshold=classification_threshold,
         categorical_hash_bins=int(features_config.get("categorical_hash_bins", 100_000)),
         embedding_dim=int(features_config.get("embedding_dim", 16)),
         activation=str(model_config.get("activation", "relu")),
@@ -1882,8 +1948,10 @@ def run_streaming_training(
         split="train",
         batch_size=batch_size,
         shuffle=True,
+        classification_threshold=classification_threshold,
         class_weight=class_weight,
         sampling_plan=sampling_plan,
+        repeat=True,
     )
     validation_dataset = None
     validation_steps = None
@@ -1899,6 +1967,7 @@ def run_streaming_training(
             split="validation",
             batch_size=batch_size,
             shuffle=False,
+            classification_threshold=classification_threshold,
             sampling_plan=sampling_plan,
         )
         validation_steps = math.ceil(int(stats["validation_rows"]) / batch_size)
@@ -1971,12 +2040,16 @@ def run_preprocessed_training(
 
     seed = int(training_config.get("seed", metadata.get("seed", 42)))
     batch_size = int(training_config.get("batch_size", 1024))
+    classification_threshold = resolve_classification_threshold(config)
     parquet_batch_rows = int(data_config.get("streaming_batch_rows", metadata.get("parquet_batch_rows", 100_000)))
     if parquet_batch_rows <= 0:
         raise ValueError("data.streaming_batch_rows must be positive.")
     row_limit = int(data_config["row_limit"]) if data_config.get("row_limit") else None
 
-    if row_limit is None:
+    metadata_classification_threshold = float(
+        metadata.get("classification_threshold", DEFAULT_CLASSIFICATION_THRESHOLD)
+    )
+    if row_limit is None and metadata_classification_threshold == classification_threshold:
         stats = preprocessing_stats_from_metadata(metadata)
     else:
         stats = collect_preprocessed_training_stats(
@@ -1985,6 +2058,7 @@ def run_preprocessed_training(
             feature_spec,
             parquet_batch_rows=parquet_batch_rows,
             row_limit=row_limit,
+            classification_threshold=classification_threshold,
         )
 
     print(f"Training from preprocessed dataset: {data_dir}", flush=True)
@@ -2009,6 +2083,7 @@ def run_preprocessed_training(
         hidden_units=tuple(int(value) for value in model_config.get("hidden_units", [256, 128, 64])),
         dropout=float(model_config.get("dropout", 0.2)),
         learning_rate=float(training_config.get("learning_rate", 0.001)),
+        classification_threshold=classification_threshold,
         categorical_hash_bins=int(features_config.get("categorical_hash_bins", 100_000)),
         embedding_dim=int(features_config.get("embedding_dim", 16)),
         activation=str(model_config.get("activation", "relu")),
@@ -2031,7 +2106,9 @@ def run_preprocessed_training(
         seed=seed,
         batch_size=batch_size,
         shuffle=True,
+        classification_threshold=classification_threshold,
         class_weight=class_weight,
+        repeat=True,
     )
     validation_dataset = None
     validation_steps = None
@@ -2044,6 +2121,7 @@ def run_preprocessed_training(
             seed=seed,
             batch_size=batch_size,
             shuffle=False,
+            classification_threshold=classification_threshold,
         )
         validation_steps = math.ceil(int(stats["validation_rows"]) / batch_size)
 
@@ -2139,6 +2217,7 @@ def main() -> None:
     seed = int(training_config.get("seed", 42))
     validation_fraction = float(training_config.get("validation_fraction", 0.2))
     batch_size = int(training_config.get("batch_size", 1024))
+    classification_threshold = resolve_classification_threshold(config)
     train_df, validation_df = split_dataframe(
         prepared,
         validation_fraction=validation_fraction,
@@ -2147,16 +2226,25 @@ def main() -> None:
     negative_sampling_config = resolve_negative_sampling_config(config)
     sampling_plan: dict[str, dict[str, int | float | bool | str]] | None = None
     if negative_sampling_config is not None:
+        train_positives, train_negatives = label_counts(
+            train_df,
+            feature_spec.label_column,
+            classification_threshold=classification_threshold,
+        )
         split_counts = {
             "train": {
                 "rows": len(train_df),
-                "positives": label_counts(train_df, feature_spec.label_column)[0],
-                "negatives": label_counts(train_df, feature_spec.label_column)[1],
+                "positives": train_positives,
+                "negatives": train_negatives,
             },
             "validation": {"rows": 0, "positives": 0, "negatives": 0},
         }
         if validation_df is not None:
-            validation_positives, validation_negatives = label_counts(validation_df, feature_spec.label_column)
+            validation_positives, validation_negatives = label_counts(
+                validation_df,
+                feature_spec.label_column,
+                classification_threshold=classification_threshold,
+            )
             split_counts["validation"] = {
                 "rows": len(validation_df),
                 "positives": validation_positives,
@@ -2191,6 +2279,7 @@ def main() -> None:
             split_name="train",
             sampling_plan=sampling_plan,
             sampling_state=sampling_state,
+            classification_threshold=classification_threshold,
         )
         if validation_df is not None:
             validation_df = apply_negative_downsampling(
@@ -2199,6 +2288,7 @@ def main() -> None:
                 split_name="validation",
                 sampling_plan=sampling_plan,
                 sampling_state=sampling_state,
+                classification_threshold=classification_threshold,
             )
             if validation_df.empty:
                 validation_df = None
@@ -2220,6 +2310,7 @@ def main() -> None:
         hidden_units=tuple(int(value) for value in model_config.get("hidden_units", [256, 128, 64])),
         dropout=float(model_config.get("dropout", 0.2)),
         learning_rate=float(training_config.get("learning_rate", 0.001)),
+        classification_threshold=classification_threshold,
         categorical_hash_bins=int(features_config.get("categorical_hash_bins", 100_000)),
         embedding_dim=int(features_config.get("embedding_dim", 16)),
         activation=str(model_config.get("activation", "relu")),
@@ -2260,6 +2351,7 @@ def main() -> None:
     class_weight = build_class_weight(
         train_df[feature_spec.label_column],
         training_config.get("class_weight"),
+        classification_threshold=classification_threshold,
     )
 
     history = model.fit(

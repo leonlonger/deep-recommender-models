@@ -80,6 +80,7 @@ def build_homepage_recommendation_model(
     hidden_units: tuple[int, ...],
     dropout: float,
     learning_rate: float,
+    classification_threshold: float = 0.5,
     categorical_hash_bins: int,
     embedding_dim: int,
     activation: str = "relu",
@@ -153,9 +154,18 @@ def build_homepage_recommendation_model(
         metrics=[
             tf.keras.metrics.AUC(name="auc"),
             PCOC(name="pcoc"),
-            tf.keras.metrics.BinaryAccuracy(name="binary_accuracy"),
-            tf.keras.metrics.Precision(name="precision"),
-            tf.keras.metrics.Recall(name="recall"),
+            tf.keras.metrics.BinaryAccuracy(
+                name="binary_accuracy",
+                threshold=classification_threshold,
+            ),
+            tf.keras.metrics.Precision(
+                name="precision",
+                thresholds=classification_threshold,
+            ),
+            tf.keras.metrics.Recall(
+                name="recall",
+                thresholds=classification_threshold,
+            ),
         ],
     )
     return model
