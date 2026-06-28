@@ -425,6 +425,14 @@ def coerce_binary_label(series: pd.Series, positive_threshold: float | None) -> 
     return numeric
 
 
+def coerce_configured_label(series: pd.Series, config: dict[str, Any]) -> pd.Series:
+    label_config = config.get("label", {})
+    positive_threshold = label_config.get("positive_threshold")
+    if positive_threshold is not None:
+        positive_threshold = float(positive_threshold)
+    return coerce_binary_label(series, positive_threshold=positive_threshold)
+
+
 def is_missing_scalar(value: Any) -> bool:
     if value is None or value is pd.NA or value is pd.NaT:
         return True
@@ -462,15 +470,7 @@ def prepare_dataframe(
     ]
     prepared = dataframe.loc[:, required_columns].copy()
 
-    label_config = config.get("label", {})
-    positive_threshold = label_config.get("positive_threshold")
-    if positive_threshold is not None:
-        positive_threshold = float(positive_threshold)
-
-    prepared[feature_spec.label_column] = coerce_binary_label(
-        prepared[feature_spec.label_column],
-        positive_threshold=positive_threshold,
-    )
+    prepared[feature_spec.label_column] = coerce_configured_label(prepared[feature_spec.label_column], config)
     before_drop = len(prepared)
     prepared = prepared.dropna(subset=[feature_spec.label_column]).reset_index(drop=True)
     dropped_rows = before_drop - len(prepared)
@@ -499,6 +499,253 @@ def prepare_streaming_dataframe(
         if "No training rows remain after dropping rows with missing labels" in str(exc):
             return pd.DataFrame(), len(dataframe)
         raise
+
+
+def resolve_negative_sampling_config(config: dict[str, Any]) -> dict[str, str | float] | None:
+    sampling_config = config.get("sampling", {})
+    if not isinstance(sampling_config, dict):
+        return None
+    if sampling_config.get("enabled") is False:
+        return None
+
+    configured: list[dict[str, str | float]] = []
+    for key in ("negative_downsample_factor", "negative_downsampling_factor"):
+        value = sampling_config.get(key)
+        if value is None:
+            continue
+        factor = float(value)
+        if factor < 1.0:
+            raise ValueError(f"sampling.{key} must be at least 1.")
+        configured.append(
+            {
+                "method": "negative_downsample_factor",
+                "value": factor,
+                "config_key": key,
+            }
+        )
+
+    value = sampling_config.get("negative_downsample_rate")
+    if value is not None:
+        rate_or_factor = float(value)
+        if rate_or_factor <= 0.0:
+            raise ValueError("sampling.negative_downsample_rate must be positive.")
+        if rate_or_factor <= 1.0:
+            configured.append(
+                {
+                    "method": "negative_keep_rate",
+                    "value": rate_or_factor,
+                    "config_key": "negative_downsample_rate",
+                }
+            )
+        else:
+            configured.append(
+                {
+                    "method": "negative_downsample_factor",
+                    "value": rate_or_factor,
+                    "config_key": "negative_downsample_rate",
+                }
+            )
+
+    for key in ("negative_keep_rate", "negative_sampling_rate"):
+        value = sampling_config.get(key)
+        if value is None:
+            continue
+        keep_rate = float(value)
+        if keep_rate <= 0.0 or keep_rate > 1.0:
+            raise ValueError(f"sampling.{key} must be in the range (0, 1].")
+        configured.append(
+            {
+                "method": "negative_keep_rate",
+                "value": keep_rate,
+                "config_key": key,
+            }
+        )
+
+    for key in ("negative_to_positive_ratio", "target_negative_to_positive_ratio"):
+        value = sampling_config.get(key)
+        if value is None:
+            continue
+        ratio = float(value)
+        if ratio <= 0.0:
+            raise ValueError(f"sampling.{key} must be positive.")
+        configured.append(
+            {
+                "method": "target_negative_to_positive_ratio",
+                "value": ratio,
+                "config_key": key,
+            }
+        )
+
+    if not configured:
+        return None
+    if len(configured) > 1:
+        keys = ", ".join(f"sampling.{entry['config_key']}" for entry in configured)
+        raise ValueError(f"Configure only one negative sampling option, got: {keys}.")
+    return configured[0]
+
+
+def describe_negative_sampling(sampling_config: dict[str, str | float]) -> str:
+    method = str(sampling_config["method"])
+    value = float(sampling_config["value"])
+    if method == "negative_downsample_factor":
+        return f"negative downsample factor={value:g} (keep about 1/{value:g} negatives)"
+    if method == "negative_keep_rate":
+        return f"negative keep rate={value:g}"
+    return f"target negative:positive={value:g}:1"
+
+
+def target_negatives_for_sampling(
+    *,
+    positives: int,
+    negatives: int,
+    sampling_config: dict[str, str | float],
+) -> int:
+    if positives <= 0 or negatives <= 0:
+        return negatives
+
+    method = str(sampling_config["method"])
+    value = float(sampling_config["value"])
+    if method == "negative_downsample_factor":
+        target_negatives = int(round(negatives / value))
+    elif method == "negative_keep_rate":
+        target_negatives = int(round(negatives * value))
+    elif method == "target_negative_to_positive_ratio":
+        target_negatives = int(round(positives * value))
+    else:
+        raise ValueError(f"Unsupported negative sampling method: {method}")
+    return min(negatives, max(0, target_negatives))
+
+
+def label_counts(prepared: pd.DataFrame, label_column: str) -> tuple[int, int]:
+    labels = prepared[label_column]
+    positives = int((labels >= 0.5).sum())
+    negatives = int(len(labels) - positives)
+    return positives, negatives
+
+
+def collect_streaming_preprocessing_label_counts(
+    path: Path,
+    feature_spec: FeatureSpec,
+    config: dict[str, Any],
+    *,
+    parquet_batch_rows: int,
+    row_limit: int | None,
+    validation_fraction: float,
+    seed: int,
+) -> dict[str, Any]:
+    split_counts: dict[str, dict[str, int]] = {
+        "train": {"rows": 0, "positives": 0, "negatives": 0},
+        "validation": {"rows": 0, "positives": 0, "negatives": 0},
+    }
+    counts: dict[str, Any] = {
+        "source_rows": 0,
+        "dropped_rows": 0,
+        "splits": split_counts,
+    }
+
+    for dataframe, row_indices in parquet_batches_to_dataframes(
+        path,
+        [feature_spec.label_column],
+        parquet_batch_rows=parquet_batch_rows,
+        row_limit=row_limit,
+    ):
+        counts["source_rows"] += len(dataframe)
+        if validation_fraction > 0.0:
+            validation_mask = validation_mask_for_indices(
+                row_indices,
+                validation_fraction=validation_fraction,
+                seed=seed,
+            )
+        else:
+            validation_mask = np.zeros(len(dataframe), dtype=bool)
+
+        for split_name, mask in (
+            ("train", ~validation_mask),
+            ("validation", validation_mask),
+        ):
+            if not mask.any():
+                continue
+            labels = coerce_configured_label(dataframe.loc[mask, feature_spec.label_column], config)
+            valid_labels = labels.dropna()
+            dropped_rows = len(labels) - len(valid_labels)
+            counts["dropped_rows"] += dropped_rows
+            if valid_labels.empty:
+                continue
+
+            positives = int((valid_labels >= 0.5).sum())
+            negatives = int(len(valid_labels) - positives)
+            split_counts[split_name]["rows"] += len(valid_labels)
+            split_counts[split_name]["positives"] += positives
+            split_counts[split_name]["negatives"] += negatives
+
+    return counts
+
+
+def build_negative_downsampling_plan(
+    split_counts: dict[str, dict[str, int]],
+    *,
+    sampling_config: dict[str, str | float],
+    seed: int,
+) -> dict[str, dict[str, int | float | bool | str]]:
+    plan: dict[str, dict[str, int | float | bool | str]] = {}
+    for split_name, counts in split_counts.items():
+        positives = int(counts["positives"])
+        negatives = int(counts["negatives"])
+        target_negatives = target_negatives_for_sampling(
+            positives=positives,
+            negatives=negatives,
+            sampling_config=sampling_config,
+        )
+
+        plan[split_name] = {
+            "positives": positives,
+            "negatives": negatives,
+            "target_negatives": target_negatives,
+            "sampling_method": str(sampling_config["method"]),
+            "sampling_value": float(sampling_config["value"]),
+            "sampling_config_key": str(sampling_config["config_key"]),
+            "downsampled": target_negatives < negatives,
+            "offset": ((seed + sum(ord(char) for char in split_name)) * 1_000_003) % max(negatives, 1),
+        }
+    return plan
+
+
+def apply_negative_downsampling(
+    prepared: pd.DataFrame,
+    *,
+    label_column: str,
+    split_name: str,
+    sampling_plan: dict[str, dict[str, int | float | bool | str]] | None,
+    sampling_state: dict[str, int],
+) -> pd.DataFrame:
+    if not sampling_plan:
+        return prepared
+
+    split_plan = sampling_plan[split_name]
+    total_negatives = int(split_plan["negatives"])
+    target_negatives = int(split_plan["target_negatives"])
+    if target_negatives >= total_negatives:
+        return prepared
+
+    labels = prepared[label_column]
+    negative_mask = (labels < 0.5).to_numpy(dtype=bool)
+    batch_negatives = int(negative_mask.sum())
+    if batch_negatives == 0:
+        return prepared
+
+    start = sampling_state.get(split_name, 0)
+    ordinals = np.arange(start, start + batch_negatives, dtype="uint64")
+    sampling_state[split_name] = start + batch_negatives
+
+    offset = np.uint64(int(split_plan["offset"]))
+    shifted = (ordinals + offset) % np.uint64(total_negatives)
+    target = np.uint64(target_negatives)
+    total = np.uint64(total_negatives)
+    keep_negative = ((shifted + np.uint64(1)) * target // total) > (shifted * target // total)
+
+    keep_mask = np.ones(len(prepared), dtype=bool)
+    keep_mask[negative_mask] = keep_negative
+    return prepared.loc[keep_mask].reset_index(drop=True)
 
 
 def split_dataframe(
@@ -691,7 +938,7 @@ def close_parquet_writers(writers: dict[str, Any]) -> None:
 
 
 def serializable_preprocessing_stats(stats: dict[str, Any]) -> dict[str, Any]:
-    return {
+    serializable = {
         "rows": int(stats["rows"]),
         "train_rows": int(stats["train_rows"]),
         "validation_rows": int(stats["validation_rows"]),
@@ -700,6 +947,22 @@ def serializable_preprocessing_stats(stats: dict[str, Any]) -> dict[str, Any]:
         "numeric_sum": [float(value) for value in stats["numeric_sum"]],
         "numeric_sum_squares": [float(value) for value in stats["numeric_sum_squares"]],
     }
+    for key in (
+        "source_rows",
+        "train_negatives",
+        "validation_positives",
+        "validation_negatives",
+        "unsampled_train_rows",
+        "unsampled_train_positives",
+        "unsampled_train_negatives",
+        "unsampled_validation_rows",
+        "unsampled_validation_positives",
+        "unsampled_validation_negatives",
+    ):
+        if key in stats:
+            value = stats[key]
+            serializable[key] = float(value) if isinstance(value, float) else int(value)
+    return serializable
 
 
 def preprocessing_stats_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -772,12 +1035,14 @@ def prepared_streaming_frames(
     seed: int,
     split: str,
     shuffle: bool = False,
+    sampling_plan: dict[str, dict[str, int | float | bool | str]] | None = None,
 ) -> Iterator[pd.DataFrame]:
     required_columns = [
         feature_spec.label_column,
         *feature_spec.numeric_columns,
         *feature_spec.categorical_columns,
     ]
+    sampling_state = {"train": 0, "validation": 0}
     for batch_index, (dataframe, row_indices) in enumerate(
         parquet_batches_to_dataframes(
             path,
@@ -803,6 +1068,15 @@ def prepared_streaming_frames(
             continue
 
         prepared, _ = prepare_streaming_dataframe(dataframe, feature_spec, config)
+        if prepared.empty:
+            continue
+        prepared = apply_negative_downsampling(
+            prepared,
+            label_column=feature_spec.label_column,
+            split_name=split,
+            sampling_plan=sampling_plan,
+            sampling_state=sampling_state,
+        )
         if prepared.empty:
             continue
         if shuffle:
@@ -853,6 +1127,7 @@ def build_streaming_dataset(
     batch_size: int,
     shuffle: bool,
     class_weight: dict[int, float] | None = None,
+    sampling_plan: dict[str, dict[str, int | float | bool | str]] | None = None,
 ) -> tf.data.Dataset:
     def generator() -> Iterator[Any]:
         for prepared in prepared_streaming_frames(
@@ -865,6 +1140,7 @@ def build_streaming_dataset(
             seed=seed,
             split=split,
             shuffle=shuffle,
+            sampling_plan=sampling_plan,
         ):
             for start in range(0, len(prepared), batch_size):
                 batch = prepared.iloc[start : start + batch_size]
@@ -1001,16 +1277,22 @@ def collect_streaming_training_stats(
     row_limit: int | None,
     validation_fraction: float,
     seed: int,
+    sampling_plan: dict[str, dict[str, int | float | bool | str]] | None = None,
 ) -> dict[str, Any]:
     stats: dict[str, Any] = {
         "rows": 0,
+        "source_rows": 0,
         "train_rows": 0,
         "validation_rows": 0,
         "dropped_rows": 0,
         "train_positives": 0.0,
+        "train_negatives": 0.0,
+        "validation_positives": 0.0,
+        "validation_negatives": 0.0,
         "numeric_sum": np.zeros(len(feature_spec.numeric_columns), dtype="float64"),
         "numeric_sum_squares": np.zeros(len(feature_spec.numeric_columns), dtype="float64"),
     }
+    sampling_state = {"train": 0, "validation": 0}
 
     required_columns = [
         feature_spec.label_column,
@@ -1023,7 +1305,7 @@ def collect_streaming_training_stats(
         parquet_batch_rows=parquet_batch_rows,
         row_limit=row_limit,
     ):
-        stats["rows"] += len(dataframe)
+        stats["source_rows"] += len(dataframe)
         if validation_fraction > 0.0:
             validation_mask = validation_mask_for_indices(
                 row_indices,
@@ -1047,18 +1329,31 @@ def collect_streaming_training_stats(
             stats["dropped_rows"] += dropped_rows
             if prepared.empty:
                 continue
+            prepared = apply_negative_downsampling(
+                prepared,
+                label_column=feature_spec.label_column,
+                split_name=split_name,
+                sampling_plan=sampling_plan,
+                sampling_state=sampling_state,
+            )
+            if prepared.empty:
+                continue
 
             row_count = len(prepared)
+            positives, negatives = label_counts(prepared, feature_spec.label_column)
+            stats["rows"] += row_count
             if split_name == "train":
                 stats["train_rows"] += row_count
-                labels = prepared[feature_spec.label_column]
-                stats["train_positives"] += float((labels >= 0.5).sum())
+                stats["train_positives"] += float(positives)
+                stats["train_negatives"] += float(negatives)
                 if feature_spec.numeric_columns:
                     numeric_values = prepared.loc[:, feature_spec.numeric_columns].to_numpy(dtype="float64")
                     stats["numeric_sum"] += numeric_values.sum(axis=0)
                     stats["numeric_sum_squares"] += np.square(numeric_values).sum(axis=0)
             else:
                 stats["validation_rows"] += row_count
+                stats["validation_positives"] += float(positives)
+                stats["validation_negatives"] += float(negatives)
 
     if stats["train_rows"] <= 0:
         raise ValueError("No streaming training rows remain after splitting and label cleanup.")
@@ -1233,17 +1528,61 @@ def run_streaming_preprocessing(
     if parquet_batch_rows <= 0:
         raise ValueError("data.streaming_batch_rows must be positive.")
     row_limit = int(data_config["row_limit"]) if data_config.get("row_limit") else None
+    negative_sampling_config = resolve_negative_sampling_config(config)
+    sampling_counts: dict[str, Any] | None = None
+    sampling_plan: dict[str, dict[str, int | float | bool | str]] | None = None
+    if negative_sampling_config is not None:
+        print(
+            "Counting labels for negative downsampling "
+            f"({describe_negative_sampling(negative_sampling_config)})...",
+            flush=True,
+        )
+        sampling_counts = collect_streaming_preprocessing_label_counts(
+            source_path,
+            feature_spec,
+            config,
+            parquet_batch_rows=parquet_batch_rows,
+            row_limit=row_limit,
+            validation_fraction=validation_fraction,
+            seed=seed,
+        )
+        sampling_plan = build_negative_downsampling_plan(
+            sampling_counts["splits"],
+            sampling_config=negative_sampling_config,
+            seed=seed,
+        )
+        for split_name, split_plan in sampling_plan.items():
+            positives = int(split_plan["positives"])
+            negatives = int(split_plan["negatives"])
+            target_negatives = int(split_plan["target_negatives"])
+            ratio = target_negatives / positives if positives else float("nan")
+            print(
+                f"  {split_name}: positives={positives}, negatives={negatives}, "
+                f"target negatives={target_negatives}, target negative:positive={ratio:.4g}:1",
+                flush=True,
+            )
 
     stats: dict[str, Any] = {
         "rows": 0,
+        "source_rows": 0,
         "train_rows": 0,
         "validation_rows": 0,
         "dropped_rows": 0,
         "train_positives": 0.0,
+        "train_negatives": 0.0,
+        "validation_positives": 0.0,
+        "validation_negatives": 0.0,
         "numeric_sum": np.zeros(len(feature_spec.numeric_columns), dtype="float64"),
         "numeric_sum_squares": np.zeros(len(feature_spec.numeric_columns), dtype="float64"),
     }
+    if sampling_counts is not None:
+        for split_name in ("train", "validation"):
+            split_counts = sampling_counts["splits"][split_name]
+            stats[f"unsampled_{split_name}_rows"] = split_counts["rows"]
+            stats[f"unsampled_{split_name}_positives"] = split_counts["positives"]
+            stats[f"unsampled_{split_name}_negatives"] = split_counts["negatives"]
     writers: dict[str, Any] = {}
+    sampling_state = {"train": 0, "validation": 0}
 
     print(f"Preprocessing streaming Parquet from: {source_path}", flush=True)
     print(f"Writing preprocessed dataset to: {output_dir}", flush=True)
@@ -1262,7 +1601,7 @@ def run_streaming_preprocessing(
             ),
             start=1,
         ):
-            stats["rows"] += len(dataframe)
+            stats["source_rows"] += len(dataframe)
             if validation_fraction > 0.0:
                 validation_mask = validation_mask_for_indices(
                     row_indices,
@@ -1286,18 +1625,31 @@ def run_streaming_preprocessing(
                 stats["dropped_rows"] += dropped_rows
                 if prepared.empty:
                     continue
+                prepared = apply_negative_downsampling(
+                    prepared,
+                    label_column=feature_spec.label_column,
+                    split_name=split_name,
+                    sampling_plan=sampling_plan,
+                    sampling_state=sampling_state,
+                )
+                if prepared.empty:
+                    continue
 
                 row_count = len(prepared)
+                positives, negatives = label_counts(prepared, feature_spec.label_column)
+                stats["rows"] += row_count
                 if split_name == "train":
                     stats["train_rows"] += row_count
-                    labels = prepared[feature_spec.label_column]
-                    stats["train_positives"] += float((labels >= 0.5).sum())
+                    stats["train_positives"] += float(positives)
+                    stats["train_negatives"] += float(negatives)
                     if feature_spec.numeric_columns:
                         numeric_values = prepared.loc[:, feature_spec.numeric_columns].to_numpy(dtype="float64")
                         stats["numeric_sum"] += numeric_values.sum(axis=0)
                         stats["numeric_sum_squares"] += np.square(numeric_values).sum(axis=0)
                 else:
                     stats["validation_rows"] += row_count
+                    stats["validation_positives"] += float(positives)
+                    stats["validation_negatives"] += float(negatives)
 
                 write_preprocessed_frame(
                     prepared,
@@ -1308,7 +1660,8 @@ def run_streaming_preprocessing(
 
             print(
                 "Processed batch "
-                f"{batch_index}: source rows={stats['rows']}, "
+                f"{batch_index}: source rows={stats['source_rows']}, "
+                f"output rows={stats['rows']}, "
                 f"train rows={stats['train_rows']}, "
                 f"validation rows={stats['validation_rows']}, "
                 f"dropped rows={stats['dropped_rows']}",
@@ -1330,6 +1683,14 @@ def run_streaming_preprocessing(
         "parquet_batch_rows": parquet_batch_rows,
         "row_limit": row_limit,
     }
+    if sampling_plan is not None:
+        metadata["sampling"] = {
+            "strategy": "keep_all_positives_downsample_negatives",
+            "method": str(negative_sampling_config["method"]),
+            "value": float(negative_sampling_config["value"]),
+            "config_key": str(negative_sampling_config["config_key"]),
+            "plan": sampling_plan,
+        }
     metadata_path = output_dir / "metadata.json"
     metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
@@ -1426,6 +1787,40 @@ def run_streaming_training(
     if row_limit:
         print(f"Row limit: {row_limit}")
 
+    negative_sampling_config = resolve_negative_sampling_config(config)
+    sampling_counts: dict[str, Any] | None = None
+    sampling_plan: dict[str, dict[str, int | float | bool | str]] | None = None
+    if negative_sampling_config is not None:
+        print(
+            "Counting labels for negative downsampling "
+            f"({describe_negative_sampling(negative_sampling_config)})...",
+            flush=True,
+        )
+        sampling_counts = collect_streaming_preprocessing_label_counts(
+            path,
+            feature_spec,
+            config,
+            parquet_batch_rows=parquet_batch_rows,
+            row_limit=row_limit,
+            validation_fraction=validation_fraction,
+            seed=seed,
+        )
+        sampling_plan = build_negative_downsampling_plan(
+            sampling_counts["splits"],
+            sampling_config=negative_sampling_config,
+            seed=seed,
+        )
+        for split_name, split_plan in sampling_plan.items():
+            positives = int(split_plan["positives"])
+            negatives = int(split_plan["negatives"])
+            target_negatives = int(split_plan["target_negatives"])
+            ratio = target_negatives / positives if positives else float("nan")
+            print(
+                f"  {split_name}: positives={positives}, negatives={negatives}, "
+                f"target negatives={target_negatives}, target negative:positive={ratio:.4g}:1",
+                flush=True,
+            )
+
     stats = collect_streaming_training_stats(
         path,
         feature_spec,
@@ -1434,6 +1829,7 @@ def run_streaming_training(
         row_limit=row_limit,
         validation_fraction=validation_fraction,
         seed=seed,
+        sampling_plan=sampling_plan,
     )
 
     print_feature_summary(feature_spec, train_size=int(stats["rows"]))
@@ -1443,6 +1839,12 @@ def run_streaming_training(
         print(f"Train rows: {stats['train_rows']}, validation rows: {stats['validation_rows']}")
     else:
         print(f"Train rows: {stats['train_rows']}, validation disabled")
+    if sampling_plan is not None:
+        print(
+            f"After downsampling: train positives={stats['train_positives']:.0f}, "
+            f"train negatives={stats['train_negatives']:.0f}",
+            flush=True,
+        )
 
     numeric_normalizer = build_numeric_normalizer_from_stats(
         feature_spec.numeric_columns,
@@ -1481,6 +1883,7 @@ def run_streaming_training(
         batch_size=batch_size,
         shuffle=True,
         class_weight=class_weight,
+        sampling_plan=sampling_plan,
     )
     validation_dataset = None
     validation_steps = None
@@ -1496,6 +1899,7 @@ def run_streaming_training(
             split="validation",
             batch_size=batch_size,
             shuffle=False,
+            sampling_plan=sampling_plan,
         )
         validation_steps = math.ceil(int(stats["validation_rows"]) / batch_size)
 
@@ -1740,8 +2144,69 @@ def main() -> None:
         validation_fraction=validation_fraction,
         seed=seed,
     )
+    negative_sampling_config = resolve_negative_sampling_config(config)
+    sampling_plan: dict[str, dict[str, int | float | bool | str]] | None = None
+    if negative_sampling_config is not None:
+        split_counts = {
+            "train": {
+                "rows": len(train_df),
+                "positives": label_counts(train_df, feature_spec.label_column)[0],
+                "negatives": label_counts(train_df, feature_spec.label_column)[1],
+            },
+            "validation": {"rows": 0, "positives": 0, "negatives": 0},
+        }
+        if validation_df is not None:
+            validation_positives, validation_negatives = label_counts(validation_df, feature_spec.label_column)
+            split_counts["validation"] = {
+                "rows": len(validation_df),
+                "positives": validation_positives,
+                "negatives": validation_negatives,
+            }
+        sampling_plan = build_negative_downsampling_plan(
+            split_counts,
+            sampling_config=negative_sampling_config,
+            seed=seed,
+        )
+        print(
+            "Applying negative downsampling "
+            f"({describe_negative_sampling(negative_sampling_config)})...",
+            flush=True,
+        )
+        for split_name, split_plan in sampling_plan.items():
+            positives = int(split_plan["positives"])
+            negatives = int(split_plan["negatives"])
+            target_negatives = int(split_plan["target_negatives"])
+            if positives or negatives:
+                ratio = target_negatives / positives if positives else float("nan")
+                print(
+                    f"  {split_name}: positives={positives}, negatives={negatives}, "
+                    f"target negatives={target_negatives}, target negative:positive={ratio:.4g}:1",
+                    flush=True,
+                )
 
-    print_feature_summary(feature_spec, train_size=len(prepared))
+        sampling_state = {"train": 0, "validation": 0}
+        train_df = apply_negative_downsampling(
+            train_df,
+            label_column=feature_spec.label_column,
+            split_name="train",
+            sampling_plan=sampling_plan,
+            sampling_state=sampling_state,
+        )
+        if validation_df is not None:
+            validation_df = apply_negative_downsampling(
+                validation_df,
+                label_column=feature_spec.label_column,
+                split_name="validation",
+                sampling_plan=sampling_plan,
+                sampling_state=sampling_state,
+            )
+            if validation_df.empty:
+                validation_df = None
+        if train_df.empty:
+            raise ValueError("No training rows remain after negative downsampling.")
+
+    total_rows = len(train_df) + (len(validation_df) if validation_df is not None else 0)
+    print_feature_summary(feature_spec, train_size=total_rows)
     if dropped_rows:
         print(f"Dropped rows with missing labels: {dropped_rows}")
     if validation_df is not None:

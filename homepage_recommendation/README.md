@@ -120,6 +120,15 @@ data:
 
 如果不想每次训练都重复做 label 清洗、类型转换、train/validation 切分和统计，可以先把原始 Parquet 处理成一个新的训练数据集：
 
+默认会保留全部正例，并对负例做确定性下采样。`negative_downsample_factor: 10` 表示负例保留约 `1/10`；如果原始数据是 `正例:负例 = 1:10`，模型读到的训练数据会接近 `1:1`：
+
+```yaml
+sampling:
+  negative_downsample_factor: 10
+```
+
+如果想直接指定采样后的目标负正比，也可以用旧配置，例如 `negative_to_positive_ratio: 1` 表示每个 split 采到约 `负例:正例 = 1:1`。
+
 ```bash
 .venv/bin/python main.py \
   --preprocess-output /mnt/disk/datasets/homepage_training_preprocessed \

@@ -73,6 +73,12 @@ label:
   # Set this if your target is a count/rating/watch-time style column and should be binarized.
   positive_threshold:
 
+sampling:
+  # Keep all positive examples and downsample negatives before the model reads them.
+  # Example: if the raw positive:negative ratio is 1:10, factor=10 keeps about 1/10
+  # of negatives so the model sees roughly 1:1 positives and negatives.
+  negative_downsample_factor: 10
+
 features:
   auto_infer: true
   numeric_columns: []
