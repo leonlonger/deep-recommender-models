@@ -1,0 +1,37 @@
+data:
+  source: preprocessed_parquet
+  path: /mnt/disk/datasets/homepage_training_preprocessed
+  inspect_row_limit: 1000
+
+label:
+  # Metadata from the preprocessed dataset is preferred. This is only a fallback.
+  column: clicked
+  positive_threshold:
+
+model:
+  objective: binary
+  metric: [binary_logloss, auc]
+  boosting_type: gbdt
+  learning_rate: 0.05
+  num_leaves: 63
+  max_depth: -1
+  min_data_in_leaf: 100
+  feature_fraction: 0.9
+  bagging_fraction: 0.8
+  bagging_freq: 1
+  lambda_l1: 0.0
+  lambda_l2: 1.0
+  min_gain_to_split: 0.0
+  deterministic: true
+  force_col_wise: true
+  verbosity: 1
+
+training:
+  num_boost_round: 1000
+  early_stopping_rounds: 50
+  classification_threshold: 0.5
+  class_weight: balanced
+  seed: 42
+  output_dir: models/homepage_lightgbm
+  log_evaluation_period: 50
+  early_stopping_first_metric_only: true

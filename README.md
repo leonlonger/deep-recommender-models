@@ -11,6 +11,7 @@
 ├── README.md
 ├── requirements.txt
 ├── homepage_recommendation/    # 首页推荐场景
+├── homepage_lightgbm/           # 首页推荐 LightGBM CTR 基线
 ├── deepfm/                     # DeepFM 排序模型
 ├── two_tower_recall/           # 双塔召回模型
 └── din/                        # DIN 排序模型
@@ -19,6 +20,7 @@
 ## 现有目录
 
 - `homepage_recommendation`: 首页推荐模型入口，适合组合召回、排序、重排等逻辑。
+- `homepage_lightgbm`: 复用首页推荐预处理数据的 LightGBM CTR 基线。
 - `deepfm`: DeepFM 模型示例。
 - `two_tower_recall`: 用户塔和物品塔召回模型示例。
 - `din`: Deep Interest Network 模型示例。

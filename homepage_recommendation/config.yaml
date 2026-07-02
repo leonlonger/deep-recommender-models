@@ -20,21 +20,11 @@ data:
       - platform
       - page_type
       - module
-      - position
-      - rank
       - request_id
       - action_id
       - surface
       - clicked
-      - scraped_brand
-      - scraped_name
-      - scraped_price
       - scraped_image_url
-      - category_level_1
-      - category_level_2
-      - category_level_3
-      - category_level_4
-      - category_confidence
       - user_is_registered
       - user_is_active
       - user_type
@@ -42,13 +32,7 @@ data:
       - user_region
       - user_city
       - acquisition_channel
-      - acquisition_source
       - preferred_brand_count
-      - preferred_brand_names
-      - pref_is_free_shipping
-      - pref_is_returnable
-      - pref_is_vintage
-      - pref_size_values
       - user_30d_impressions
       - user_30d_clicks
       - user_30d_favorites
@@ -60,11 +44,6 @@ data:
       - domain_30d_favorites
       - app_7d_product_impress
       - app_7d_product_click
-      - trending_score_7d
-      - trending_rank_7d
-      - seller_top50_score_7d
-      - seller_rank_7d
-      - recent_viewed_rank_1d
 
 label:
   # If empty, main.py tries common names such as label, clicked, is_click, conversion.
@@ -90,6 +69,28 @@ features:
     - request_id
     - action_id
     - scraped_image_url
+    # Source-data missing rate > 50%; exclude from auto-inferred model features.
+    - category_level_4
+    - pref_is_free_shipping
+    - pref_is_returnable
+    - pref_is_vintage
+    - position
+    - rank
+    - recent_viewed_rank_1d
+    - seller_rank_7d
+    - seller_top50_score_7d
+    - trending_rank_7d
+    - trending_score_7d
+    - category_level_3
+    - category_level_2
+    - category_confidence
+    - category_level_1
+    - pref_size_values
+    - scraped_brand
+    - scraped_name
+    - scraped_price
+    - preferred_brand_names
+    - acquisition_source
   categorical_hash_bins: 20000
   embedding_dim: 32
 
