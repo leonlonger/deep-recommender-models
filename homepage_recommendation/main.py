@@ -6,6 +6,13 @@ import argparse
 import copy
 import json
 import math
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -61,6 +68,16 @@ ID_LIKE_COLUMNS = {
 }
 
 DEFAULT_CLASSIFICATION_THRESHOLD = 0.5
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+@dataclass
+class TrainingRunContext:
+    run_id: str
+    base_output_dir: Path
+    output_dir: Path
+    tensorboard_log_dir: Path | None = None
+    reproducibility_dir: Path | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -1436,28 +1453,82 @@ def serializable_history(history: tf.keras.callbacks.History) -> dict[str, list[
     }
 
 
+def sanitize_run_id(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
+    sanitized = sanitized.strip(".-")
+    if not sanitized:
+        raise ValueError("Training run_id cannot be empty after sanitization.")
+    return sanitized
+
+
+def default_run_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def requested_run_id(training_config: dict[str, Any]) -> str | None:
+    run_id = training_config.get("run_id")
+    if run_id:
+        return str(run_id)
+
+    tensorboard_config = training_config.get("tensorboard", {})
+    if isinstance(tensorboard_config, dict):
+        run_name = tensorboard_config.get("run_name")
+        if run_name and str(run_name).lower() != "auto":
+            return str(run_name)
+    return None
+
+
+def unique_training_run_id(base_output_dir: Path, configured_run_id: str | None = None) -> str:
+    base_run_id = sanitize_run_id(configured_run_id or default_run_id())
+    runs_dir = base_output_dir / "runs"
+    candidate = base_run_id
+    suffix = 1
+    while (runs_dir / candidate).exists():
+        candidate = f"{base_run_id}-{suffix:02d}"
+        suffix += 1
+    return candidate
+
+
+def create_training_run_context(training_config: dict[str, Any]) -> TrainingRunContext:
+    base_output_dir = resolve_path(training_config.get("output_dir", "models/homepage_dnn"))
+    run_id = unique_training_run_id(base_output_dir, requested_run_id(training_config))
+    output_dir = base_output_dir / "runs" / run_id
+    output_dir.mkdir(parents=True, exist_ok=False)
+
+    training_config["run_id"] = run_id
+    training_config["base_output_dir"] = str(base_output_dir)
+    training_config["resolved_output_dir"] = str(output_dir)
+
+    print(f"Training run id: {run_id}")
+    print(f"Training output dir: {output_dir}")
+    return TrainingRunContext(
+        run_id=run_id,
+        base_output_dir=base_output_dir,
+        output_dir=output_dir,
+    )
+
+
 def resolve_tensorboard_log_dir(
     tensorboard_config: dict[str, Any],
-    output_dir: Path,
+    run_context: TrainingRunContext,
 ) -> Path:
     base_log_dir = resolve_path(
-        tensorboard_config.get("log_dir", output_dir / "tensorboard"),
+        tensorboard_config.get("log_dir", run_context.base_output_dir / "tensorboard"),
     )
-    run_name = tensorboard_config.get("run_name")
-    if not run_name or str(run_name).lower() == "auto":
-        run_name = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return base_log_dir / str(run_name)
+    return base_log_dir / run_context.run_id
 
 
 def build_tensorboard_callback(
     tensorboard_config: dict[str, Any],
-    output_dir: Path,
+    run_context: TrainingRunContext,
 ) -> tf.keras.callbacks.TensorBoard | None:
     if not tensorboard_config.get("enabled", True):
         return None
 
-    log_dir = resolve_tensorboard_log_dir(tensorboard_config, output_dir)
+    log_dir = resolve_tensorboard_log_dir(tensorboard_config, run_context)
     log_dir.mkdir(parents=True, exist_ok=True)
+    run_context.tensorboard_log_dir = log_dir
+    tensorboard_config["resolved_run_name"] = run_context.run_id
     tensorboard_config["resolved_log_dir"] = str(log_dir)
     print(f"TensorBoard log dir: {log_dir}")
 
@@ -1477,15 +1548,309 @@ def build_tensorboard_callback(
         ) from exc
 
 
+def json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, argparse.Namespace):
+        return vars(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    return str(value)
+
+
+def write_json_file(path: Path, value: Any) -> None:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, default=json_default),
+        encoding="utf-8",
+    )
+
+
+def run_reproducibility_command(
+    command: list[str],
+    *,
+    cwd: Path = PROJECT_ROOT,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return {
+            "command": command,
+            "returncode": None,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+
+    return {
+        "command": command,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+    }
+
+
+def command_text(result: dict[str, Any]) -> str:
+    sections = [
+        f"$ {' '.join(str(part) for part in result['command'])}",
+        f"returncode: {result['returncode']}",
+    ]
+    if result.get("stdout"):
+        sections.extend(["", "stdout:", str(result["stdout"])])
+    if result.get("stderr"):
+        sections.extend(["", "stderr:", str(result["stderr"])])
+    return "\n".join(sections).rstrip() + "\n"
+
+
+def collect_environment_info() -> dict[str, Any]:
+    try:
+        tensorflow_build_info = {
+            key: str(value)
+            for key, value in tf.sysconfig.get_build_info().items()
+        }
+    except Exception as exc:  # pragma: no cover - diagnostic best effort
+        tensorflow_build_info = {"error": str(exc)}
+
+    return {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "cwd": os.getcwd(),
+        "python": {
+            "executable": sys.executable,
+            "version": sys.version,
+        },
+        "platform": {
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+        },
+        "packages": {
+            "tensorflow": tf.__version__,
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "pyyaml": getattr(yaml, "__version__", None),
+        },
+        "tensorflow": {
+            "build_info": tensorflow_build_info,
+            "physical_devices": [
+                {"name": device.name, "device_type": device.device_type}
+                for device in tf.config.list_physical_devices()
+            ],
+            "gpu_devices": [
+                {"name": device.name, "device_type": device.device_type}
+                for device in tf.config.list_physical_devices("GPU")
+            ],
+        },
+        "environment_variables": {
+            key: os.environ.get(key)
+            for key in (
+                "CUDA_VISIBLE_DEVICES",
+                "LD_LIBRARY_PATH",
+                "PYTHONPATH",
+                "TF_CPP_MIN_LOG_LEVEL",
+            )
+        },
+    }
+
+
+def write_environment_reproducibility_files(reproducibility_dir: Path) -> None:
+    write_json_file(
+        reproducibility_dir / "environment.json",
+        collect_environment_info(),
+    )
+
+    pip_freeze = run_reproducibility_command(
+        [sys.executable, "-m", "pip", "freeze"],
+        timeout=120,
+    )
+    (reproducibility_dir / "pip_freeze.txt").write_text(
+        pip_freeze["stdout"] if pip_freeze["returncode"] == 0 else command_text(pip_freeze),
+        encoding="utf-8",
+    )
+
+
+def write_git_reproducibility_files(reproducibility_dir: Path) -> None:
+    git_commands = {
+        "top_level": ["git", "rev-parse", "--show-toplevel"],
+        "branch": ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        "commit": ["git", "rev-parse", "HEAD"],
+        "status_short": ["git", "status", "--short"],
+    }
+    git_info = {
+        key: run_reproducibility_command(command)
+        for key, command in git_commands.items()
+    }
+    write_json_file(reproducibility_dir / "git_info.json", git_info)
+
+    status = run_reproducibility_command(["git", "status", "--short"])
+    (reproducibility_dir / "git_status.txt").write_text(
+        command_text(status),
+        encoding="utf-8",
+    )
+
+    staged_diff = run_reproducibility_command(["git", "diff", "--cached", "--binary", "--", "."])
+    unstaged_diff = run_reproducibility_command(["git", "diff", "--binary", "--", "."])
+    diff_text = (
+        "# git diff --cached --binary -- .\n"
+        f"{staged_diff['stdout'] or ''}\n"
+        "# git diff --binary -- .\n"
+        f"{unstaged_diff['stdout'] or ''}"
+    )
+    if staged_diff["returncode"] not in (0, None) or unstaged_diff["returncode"] not in (0, None):
+        diff_text += "\n\n# diff command diagnostics\n"
+        diff_text += command_text(staged_diff)
+        diff_text += command_text(unstaged_diff)
+    (reproducibility_dir / "git_diff.patch").write_text(diff_text, encoding="utf-8")
+
+
+def code_snapshot_ignored_names(_: str, names: list[str]) -> set[str]:
+    ignored_exact = {
+        ".agents",
+        ".codex",
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        "__pycache__",
+        "data",
+        "models",
+    }
+    ignored_suffixes = (".pyc", ".pyo")
+    return {
+        name
+        for name in names
+        if name in ignored_exact or name.endswith(ignored_suffixes)
+    }
+
+
+def copy_code_snapshot(destination: Path) -> None:
+    shutil.copytree(
+        PROJECT_ROOT,
+        destination,
+        ignore=code_snapshot_ignored_names,
+        symlinks=True,
+    )
+
+
+def path_metadata(path: Path) -> dict[str, Any]:
+    expanded = path.expanduser()
+    metadata: dict[str, Any] = {
+        "path": str(expanded),
+        "exists": expanded.exists(),
+    }
+    if not expanded.exists():
+        return metadata
+
+    stat = expanded.stat()
+    metadata.update(
+        {
+            "resolved_path": str(expanded.resolve()),
+            "is_file": expanded.is_file(),
+            "is_dir": expanded.is_dir(),
+            "mtime_utc": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+        }
+    )
+    if expanded.is_file():
+        metadata["size_bytes"] = stat.st_size
+    return metadata
+
+
+def configured_data_paths(config: dict[str, Any], config_path: Path) -> list[Path]:
+    data_config = config.get("data", {})
+    data_path = data_config.get("path")
+    if not data_path:
+        return []
+    return [resolve_path(data_path, base_dir=config_path.parent)]
+
+
+def collect_data_source_info(
+    config: dict[str, Any],
+    config_path: Path,
+    extra_paths: list[Path] | None = None,
+) -> dict[str, Any]:
+    paths = configured_data_paths(config, config_path)
+    if extra_paths:
+        paths.extend(extra_paths)
+
+    deduped_paths: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path.expanduser())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_paths.append(path)
+
+    return {
+        "data_config": config.get("data", {}),
+        "paths": [path_metadata(path) for path in deduped_paths],
+        "note": "Training data files are recorded for reproducibility but are not copied.",
+    }
+
+
+def save_reproducibility_bundle(
+    run_context: TrainingRunContext,
+    *,
+    config: dict[str, Any],
+    config_path: Path,
+    args: argparse.Namespace,
+    data_source_paths: list[Path] | None = None,
+) -> Path:
+    reproducibility_dir = run_context.output_dir / "reproducibility"
+    reproducibility_dir.mkdir(parents=True, exist_ok=True)
+    run_context.reproducibility_dir = reproducibility_dir
+
+    source_config_path = config_path.expanduser()
+    if source_config_path.exists():
+        shutil.copy2(source_config_path, reproducibility_dir / "source_config.yaml")
+    else:
+        (reproducibility_dir / "source_config_missing.txt").write_text(
+            f"Source config was not found: {source_config_path}\n",
+            encoding="utf-8",
+        )
+
+    (reproducibility_dir / "effective_config.yaml").write_text(
+        yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    write_json_file(
+        reproducibility_dir / "args.json",
+        {
+            "argv": sys.argv,
+            "args": vars(args),
+            "config_path": str(config_path),
+            "cwd": os.getcwd(),
+            "project_root": str(PROJECT_ROOT),
+        },
+    )
+    write_json_file(
+        reproducibility_dir / "data_sources.json",
+        collect_data_source_info(config, config_path, data_source_paths),
+    )
+    write_environment_reproducibility_files(reproducibility_dir)
+    write_git_reproducibility_files(reproducibility_dir)
+    copy_code_snapshot(reproducibility_dir / "code")
+
+    print(f"Reproducibility bundle dir: {reproducibility_dir}")
+    return reproducibility_dir
+
+
 def export_model(
     model: tf.keras.Model,
-    output_dir: Path,
+    run_context: TrainingRunContext,
     *,
     feature_spec: FeatureSpec,
     history: tf.keras.callbacks.History,
     evaluation: dict[str, float],
     config: dict[str, Any],
 ) -> None:
+    output_dir = run_context.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     keras_path = output_dir / "final.keras"
     saved_model_dir = output_dir / "saved_model"
@@ -1498,6 +1863,19 @@ def export_model(
         tf.saved_model.save(model, str(saved_model_dir))
 
     metadata = {
+        "run_id": run_context.run_id,
+        "output_dir": str(run_context.output_dir),
+        "base_output_dir": str(run_context.base_output_dir),
+        "tensorboard_log_dir": (
+            str(run_context.tensorboard_log_dir)
+            if run_context.tensorboard_log_dir is not None
+            else None
+        ),
+        "reproducibility_dir": (
+            str(run_context.reproducibility_dir)
+            if run_context.reproducibility_dir is not None
+            else None
+        ),
         "feature_spec": feature_spec.to_dict(),
         "history": serializable_history(history),
         "evaluation": {metric: float(value) for metric, value in evaluation.items()},
@@ -1512,6 +1890,8 @@ def export_model(
     print(f"  keras_model: {keras_path}")
     print(f"  saved_model: {saved_model_dir}")
     print(f"  metadata: {metadata_path}")
+    if run_context.reproducibility_dir is not None:
+        print(f"  reproducibility: {run_context.reproducibility_dir}")
 
 
 def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1785,7 +2165,7 @@ def run_streaming_preprocessing(
 
 def build_training_callbacks(
     training_config: dict[str, Any],
-    output_dir: Path,
+    run_context: TrainingRunContext,
     *,
     monitor: str,
     skip_export: bool,
@@ -1793,13 +2173,13 @@ def build_training_callbacks(
     callbacks: list[tf.keras.callbacks.Callback] = []
     tensorboard_callback = build_tensorboard_callback(
         training_config.setdefault("tensorboard", {}),
-        output_dir,
+        run_context,
     )
     if tensorboard_callback is not None:
         callbacks.append(tensorboard_callback)
     if not skip_export:
         callbacks.append(tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(output_dir / "best.keras"),
+            filepath=str(run_context.output_dir / "best.keras"),
             monitor=monitor,
             mode="max",
             save_best_only=True,
@@ -1924,7 +2304,7 @@ def run_streaming_training(
         learning_rate=float(training_config.get("learning_rate", 0.001)),
         classification_threshold=classification_threshold,
         categorical_hash_bins=int(features_config.get("categorical_hash_bins", 100_000)),
-        embedding_dim=int(features_config.get("embedding_dim", 16)),
+        embedding_dim=int(features_config.get("embedding_dim", 32)),
         activation=str(model_config.get("activation", "relu")),
         l2=float(model_config.get("l2", 0.0)),
         numeric_normalizer=numeric_normalizer,
@@ -1972,15 +2352,22 @@ def run_streaming_training(
         )
         validation_steps = math.ceil(int(stats["validation_rows"]) / batch_size)
 
-    output_dir = Path(training_config.get("output_dir", "models/homepage_dnn"))
-    output_dir.mkdir(parents=True, exist_ok=True)
+    run_context = create_training_run_context(training_config)
     monitor = "val_auc" if validation_dataset is not None else "auc"
     callbacks = build_training_callbacks(
         training_config,
-        output_dir,
+        run_context,
         monitor=monitor,
         skip_export=args.skip_export,
     )
+    if not args.skip_export:
+        save_reproducibility_bundle(
+            run_context,
+            config=config,
+            config_path=config_path,
+            args=args,
+            data_source_paths=[path],
+        )
 
     steps_per_epoch = math.ceil(int(stats["train_rows"]) / batch_size)
     history = model.fit(
@@ -2008,7 +2395,7 @@ def run_streaming_training(
 
     export_model(
         model,
-        output_dir,
+        run_context,
         feature_spec=feature_spec,
         history=history,
         evaluation=evaluation,
@@ -2085,7 +2472,7 @@ def run_preprocessed_training(
         learning_rate=float(training_config.get("learning_rate", 0.001)),
         classification_threshold=classification_threshold,
         categorical_hash_bins=int(features_config.get("categorical_hash_bins", 100_000)),
-        embedding_dim=int(features_config.get("embedding_dim", 16)),
+        embedding_dim=int(features_config.get("embedding_dim", 32)),
         activation=str(model_config.get("activation", "relu")),
         l2=float(model_config.get("l2", 0.0)),
         numeric_normalizer=numeric_normalizer,
@@ -2125,15 +2512,29 @@ def run_preprocessed_training(
         )
         validation_steps = math.ceil(int(stats["validation_rows"]) / batch_size)
 
-    output_dir = Path(training_config.get("output_dir", "models/homepage_dnn"))
-    output_dir.mkdir(parents=True, exist_ok=True)
+    run_context = create_training_run_context(training_config)
     monitor = "val_auc" if validation_dataset is not None else "auc"
     callbacks = build_training_callbacks(
         training_config,
-        output_dir,
+        run_context,
         monitor=monitor,
         skip_export=args.skip_export,
     )
+    data_source_paths = [
+        data_dir,
+        train_path,
+        data_dir / "metadata.json",
+    ]
+    if validation_path is not None:
+        data_source_paths.append(validation_path)
+    if not args.skip_export:
+        save_reproducibility_bundle(
+            run_context,
+            config=config,
+            config_path=config_path,
+            args=args,
+            data_source_paths=data_source_paths,
+        )
 
     steps_per_epoch = math.ceil(int(stats["train_rows"]) / batch_size)
     history = model.fit(
@@ -2161,7 +2562,7 @@ def run_preprocessed_training(
 
     export_model(
         model,
-        output_dir,
+        run_context,
         feature_spec=feature_spec,
         history=history,
         evaluation=evaluation,
@@ -2312,7 +2713,7 @@ def main() -> None:
         learning_rate=float(training_config.get("learning_rate", 0.001)),
         classification_threshold=classification_threshold,
         categorical_hash_bins=int(features_config.get("categorical_hash_bins", 100_000)),
-        embedding_dim=int(features_config.get("embedding_dim", 16)),
+        embedding_dim=int(features_config.get("embedding_dim", 32)),
         activation=str(model_config.get("activation", "relu")),
         l2=float(model_config.get("l2", 0.0)),
         numeric_normalizer=numeric_normalizer,
@@ -2338,15 +2739,21 @@ def main() -> None:
         else None
     )
 
-    output_dir = Path(training_config.get("output_dir", "models/homepage_dnn"))
-    output_dir.mkdir(parents=True, exist_ok=True)
+    run_context = create_training_run_context(training_config)
     monitor = "val_auc" if validation_dataset is not None else "auc"
     callbacks = build_training_callbacks(
         training_config,
-        output_dir,
+        run_context,
         monitor=monitor,
         skip_export=args.skip_export,
     )
+    if not args.skip_export:
+        save_reproducibility_bundle(
+            run_context,
+            config=config,
+            config_path=config_path,
+            args=args,
+        )
 
     class_weight = build_class_weight(
         train_df[feature_spec.label_column],
@@ -2373,7 +2780,7 @@ def main() -> None:
 
     export_model(
         model,
-        output_dir,
+        run_context,
         feature_spec=feature_spec,
         history=history,
         evaluation=evaluation,

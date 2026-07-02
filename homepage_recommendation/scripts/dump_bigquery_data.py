@@ -38,6 +38,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--page-size", type=int, default=50_000, help="Rows per fallback BigQuery result page.")
     parser.add_argument("--progress-rows", type=int, default=100_000, help="Rows between progress messages.")
     parser.add_argument(
+        "--row-group-rows",
+        type=int,
+        default=250_000,
+        help="Target rows per Parquet row group when compacting BigQuery batches.",
+    )
+    parser.add_argument(
+        "--compression",
+        default="zstd",
+        help="Parquet compression codec. Defaults to zstd.",
+    )
+    parser.add_argument(
+        "--no-compact-row-groups",
+        action="store_true",
+        help="Write each BigQuery Arrow batch directly, matching the old row group behavior.",
+    )
+    parser.add_argument(
         "--max-stream-count",
         type=int,
         default=1,
@@ -211,23 +227,83 @@ def iter_arrow_tables(
             yield pa.Table.from_pandas(dataframe, preserve_index=False)
 
 
-def write_parquet_chunks(chunks: Any, output_path: Path, *, progress_rows: int) -> int:
+def write_parquet_chunks(
+    chunks: Any,
+    output_path: Path,
+    *,
+    progress_rows: int,
+    row_group_rows: int,
+    compression: str,
+    compact_row_groups: bool,
+) -> int:
+    if compact_row_groups and row_group_rows <= 0:
+        raise ValueError("--row-group-rows must be positive unless --no-compact-row-groups is set.")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(f"{output_path.name}.tmp")
     writer: pq.ParquetWriter | None = None
     total_rows = 0
     next_progress = max(progress_rows, 1)
+    buffered_tables: list[pa.Table] = []
+    buffered_rows = 0
+
+    def ensure_writer(schema: pa.Schema) -> pq.ParquetWriter:
+        nonlocal writer
+        if writer is None:
+            writer = pq.ParquetWriter(
+                temporary_path,
+                schema,
+                compression=compression,
+            )
+        return writer
+
+    def record_written_rows(row_count: int) -> None:
+        nonlocal total_rows, next_progress
+        total_rows += row_count
+        if total_rows >= next_progress:
+            print(f"Wrote {total_rows} rows...")
+            while total_rows >= next_progress:
+                next_progress += max(progress_rows, 1)
+
+    def flush_buffer(*, final: bool = False) -> None:
+        nonlocal buffered_tables, buffered_rows
+        if not buffered_rows:
+            return
+
+        combined = pa.concat_tables(buffered_tables)
+        rows_to_write = combined.num_rows if final else (combined.num_rows // row_group_rows) * row_group_rows
+        if rows_to_write <= 0:
+            return
+
+        table_to_write = combined.slice(0, rows_to_write)
+        ensure_writer(table_to_write.schema).write_table(
+            table_to_write,
+            row_group_size=row_group_rows,
+        )
+        record_written_rows(rows_to_write)
+
+        remaining_rows = combined.num_rows - rows_to_write
+        if remaining_rows:
+            buffered_tables = [combined.slice(rows_to_write, remaining_rows)]
+            buffered_rows = remaining_rows
+        else:
+            buffered_tables = []
+            buffered_rows = 0
+
     try:
         for table in chunks:
             if table.num_rows == 0:
                 continue
-            if writer is None:
-                writer = pq.ParquetWriter(temporary_path, table.schema)
-            writer.write_table(table)
-            total_rows += table.num_rows
-            if total_rows >= next_progress:
-                print(f"Wrote {total_rows} rows...")
-                next_progress += max(progress_rows, 1)
+            if not compact_row_groups:
+                ensure_writer(table.schema).write_table(table)
+                record_written_rows(table.num_rows)
+                continue
+
+            buffered_tables.append(table)
+            buffered_rows += table.num_rows
+            flush_buffer()
+        if compact_row_groups:
+            flush_buffer(final=True)
     finally:
         if writer is not None:
             writer.close()
@@ -244,6 +320,7 @@ def main() -> None:
     project_id = bigquery_config.get("project_id")
     output_path = resolve_output_path(config, args, config_path=config_path)
     sql = build_bigquery_sql(bigquery_config, row_limit=args.limit)
+    compact_row_groups = not args.no_compact_row_groups
 
     client = build_bigquery_client(
         project_id=project_id,
@@ -273,6 +350,11 @@ def main() -> None:
             print(f"  table: {table_id}")
             print(f"  selected_columns: {len(selected_fields or table.schema)}")
             print(f"Writing local Parquet: {output_path}")
+            print(f"  compression: {args.compression}")
+            if compact_row_groups:
+                print(f"  target row group rows: {args.row_group_rows}")
+            else:
+                print("  row group compaction: disabled")
             row_iterator = active_client.list_rows(
                 table,
                 selected_fields=selected_fields,
@@ -282,6 +364,11 @@ def main() -> None:
             print("Running BigQuery dump query:")
             print(sql)
             print(f"Writing local Parquet: {output_path}")
+            print(f"  compression: {args.compression}")
+            if compact_row_groups:
+                print(f"  target row group rows: {args.row_group_rows}")
+            else:
+                print("  row group compaction: disabled")
             query_job = active_client.query(sql)
             row_iterator = query_job.result(page_size=args.page_size)
         chunks = iter_arrow_tables(
@@ -291,7 +378,14 @@ def main() -> None:
             max_stream_count=args.max_stream_count,
             max_queue_size=args.max_queue_size,
         )
-        return write_parquet_chunks(chunks, output_path, progress_rows=args.progress_rows)
+        return write_parquet_chunks(
+            chunks,
+            output_path,
+            progress_rows=args.progress_rows,
+            row_group_rows=args.row_group_rows,
+            compression=args.compression,
+            compact_row_groups=compact_row_groups,
+        )
 
     try:
         total_rows = run_dump(client)

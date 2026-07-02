@@ -91,7 +91,7 @@ features:
     - action_id
     - scraped_image_url
   categorical_hash_bins: 20000
-  embedding_dim: 8
+  embedding_dim: 32
 
 model:
   hidden_units: [256, 128, 64]
@@ -104,7 +104,7 @@ training:
   learning_rate: 0.001
   # Score cutoff used by binary metrics and sampling stats.
   classification_threshold: 0.5
-  epochs: 10
+  epochs: 1000
   validation_fraction: 0.2
   seed: 42
   early_stopping_patience: 2

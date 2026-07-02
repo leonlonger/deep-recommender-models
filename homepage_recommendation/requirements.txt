@@ -1,4 +1,4 @@
-tensorflow
+tensorflow==2.15.*
 tensorboard
 google-cloud-bigquery[pandas]
 google-cloud-bigquery-storage

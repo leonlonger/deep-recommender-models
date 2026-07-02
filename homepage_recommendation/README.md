@@ -115,7 +115,7 @@ features:
 ```
 
 训练默认只读取本地 `data.path`，不会访问 BigQuery。
-训练时会默认写 TensorBoard event logs 到 `models/homepage_dnn/tensorboard/<UTC时间戳>/`，终端里也会打印实际的 `TensorBoard log dir`。
+每次训练会生成一个独立 `run_id`，模型产物默认写到 `models/homepage_dnn/runs/<run_id>/`。TensorBoard event logs 会统一写到 `models/homepage_dnn/tensorboard/<run_id>/`，终端里也会打印实际的 `Training run id`、`Training output dir` 和 `TensorBoard log dir`。
 
 本地 Parquet 训练默认启用 streaming，会先读取 `data.inspect_row_limit` 行样本推断 schema，然后用 `data.streaming_batch_rows` 分块扫描 Parquet、统计 normalizer/class weight、再分块喂给 TensorFlow。这样不会把 20GB+ Parquet 一次性读进 pandas。可以在 `config.yaml` 调整每块行数：
 
@@ -203,12 +203,13 @@ scripts/train_gpu.sh --limit 5000 --epochs 1 --skip-export
 
 训练完成后会输出：
 
-- `models/homepage_dnn/best.keras`
-- `models/homepage_dnn/final.keras`
-- `models/homepage_dnn/saved_model`
-- `models/homepage_dnn/training_metadata.json`
+- `models/homepage_dnn/runs/<run_id>/best.keras`
+- `models/homepage_dnn/runs/<run_id>/final.keras`
+- `models/homepage_dnn/runs/<run_id>/saved_model`
+- `models/homepage_dnn/runs/<run_id>/training_metadata.json`
+- `models/homepage_dnn/runs/<run_id>/reproducibility/`
 
-`training_metadata.json` 的 `history` 和 `evaluation` 会保留 AUC、PCOC、accuracy、precision、recall 等指标；启用验证集时 `history` 里也会包含 `val_pcoc`。
+`training_metadata.json` 的 `history` 和 `evaluation` 会保留 AUC、PCOC、accuracy、precision、recall 等指标；启用验证集时 `history` 里也会包含 `val_pcoc`。`reproducibility/` 会保存本次训练的代码快照、原始配置、CLI 覆盖后的有效配置、git diff/status、环境信息、`pip freeze` 和训练数据路径信息；不会复制大 Parquet 数据文件。
 
 如果当前工作区磁盘空间不足，可以把模型写到 `/tmp`：
 
@@ -224,7 +225,7 @@ scripts/train_gpu.sh --limit 5000 --epochs 1 --skip-export
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-先启动一次训练，等终端出现 `TensorBoard log dir: ...` 后，另开一个终端运行：
+启动一次 TensorBoard，指向统一的 TensorBoard 根目录，就可以看到这个目录下所有训练 run：
 
 ```bash
 .venv/bin/tensorboard --logdir models/homepage_dnn/tensorboard --host 127.0.0.1 --port 6006
@@ -236,7 +237,7 @@ scripts/train_gpu.sh --limit 5000 --epochs 1 --skip-export
 http://127.0.0.1:6006
 ```
 
-如果训练时用了自定义日志目录，例如 `--tensorboard-log-dir /tmp/homepage_tensorboard`，启动 TensorBoard 时也把 `--logdir` 换成同一个目录。
+如果训练时用了自定义日志目录，例如 `--tensorboard-log-dir /tmp/homepage_tensorboard`，每次训练会写到 `/tmp/homepage_tensorboard/<run_id>/`，启动 TensorBoard 时也把 `--logdir` 换成同一个根目录。
 
 ## 本地 CSV 调试
 

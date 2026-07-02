@@ -2,11 +2,19 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_BIN="${PYTHON:-$ROOT_DIR/.venv/bin/python}"
+TF215_PYTHON="$ROOT_DIR/.venv-tf215/bin/python"
+
+if [[ -n "${PYTHON:-}" ]]; then
+  PYTHON_BIN="$PYTHON"
+elif [[ -x "$TF215_PYTHON" ]]; then
+  PYTHON_BIN="$TF215_PYTHON"
+else
+  PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+fi
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "Python not found or not executable: $PYTHON_BIN" >&2
-  echo "Create the virtualenv first, for example: python3 -m venv .venv" >&2
+  echo "Create the virtualenv first, for example: python3.11 -m venv .venv-tf215" >&2
   exit 1
 fi
 

@@ -1,4 +1,8 @@
 .venv/
+.venv-tf215/
+.uv-cache/
+.uv-python/
+.tools/uv/
 __pycache__/
 *.py[cod]
 models/
